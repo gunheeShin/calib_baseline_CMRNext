@@ -26,8 +26,8 @@ from camera_model import CameraModel
 from models.get_model import get_model
 from quaternion_distances import quaternion_loss
 
-import matplotlib
-matplotlib.use('TkAgg')
+# import matplotlib
+# matplotlib.use('TkAgg')
 
 import matplotlib.pyplot as plt
 from utils import (downsample_depth, merge_inputs, get_flow_zforward, quat2mat, tvector2mat,
@@ -300,7 +300,9 @@ def evaluate_calibration(_config, seed):
         epe.append([])
         final_calib_RTs.append([])
     tbar = tqdm(TestImgLoader)
+    idex = 0
     for batch_idx, sample in enumerate(tbar):
+        idex += 1
         lidar_input = []
         rgb_input = []
 
@@ -469,6 +471,64 @@ def evaluate_calibration(_config, seed):
                     points_2d = points_2d[corr_to_keep[:num_corr_to_keep]]
                     obj_coord_zforward = obj_coord_zforward[corr_to_keep[:num_corr_to_keep]]
 
+            if _config['viz']:
+                std = [0.229, 0.224, 0.225]
+                mean = [0.485, 0.456, 0.406]
+
+                vis_img = sample['rgb'][idx].clone().cpu().permute(1, 2, 0).numpy()
+                vis_img = vis_img * std + mean
+
+                h, w, _ = vis_img.shape
+                # float 타입으로 생성해야 0.0 ~ 1.0 사이의 알파값을 다룰 수 있습니다.
+                overlay_img = np.zeros((h, w, 4), dtype=np.float32)
+
+                # --- 3. 오버레이 이미지에 대응점 그리기 ---
+                # 깊이(z값)와 컬러맵을 준비합니다.
+                depths = obj_coord_zforward[:, 2]
+                vmax = np.percentile(depths, 95)  # 극단적인 값에 의한 왜곡 방지
+                norm_depths = np.clip(depths / vmax, 0, 1)
+                cmap = cm.get_cmap('jet')  # overlay_imgs에서 사용된 'jet' 컬러맵
+
+                b_uv = uv.float()
+                b_uv = b_uv[valid_indexes]
+                b_uv = b_uv[valid_indexes2]
+                points_2d_before = b_uv.cpu().numpy()
+                # 각 대응점에 깊이 색상과 투명도를 적용하여 원을 그립니다.
+                dw_ratio = 3
+                for i in range(0,len(points_2d), dw_ratio):
+                    pt = tuple(map(int, points_2d[i]))
+                    b_pt = tuple(map(int, points_2d_before[i]))
+
+                    # 깊이에 해당하는 색상을 cmap에서 가져옵니다 (R, G, B, A 순서).
+                    color_rgba = cmap(norm_depths[i])
+
+                    # cv2.circle은 (B, G, R, A) 순서를 사용하므로 채널 순서를 변경합니다.
+                    # 또한, 투명도를 0.8로 고정하여 더 잘 보이게 합니다.
+                    color_bgra = (color_rgba[2], color_rgba[1], color_rgba[0], 0.8)
+
+                    # cv2.line(overlay_img, pt, b_pt, color=color_bgra, thickness=1)
+                    cv2.arrowedLine(overlay_img, b_pt, pt, color=color_bgra, thickness=1, tipLength=0.05)
+                    # cv2.circle(overlay_img, b_pt, radius=1, color=color_bgra, thickness=-1)
+
+                # --- 4. 배경과 오버레이 합성 (Alpha Blending) ---
+                # overlay_imgs의 합성 공식과 동일한 방식입니다.
+                alpha = overlay_img[:, :, 3:]  # 알파 채널 (H, W, 1)
+                foreground = overlay_img[:, :, :3]  # RGB 채널 (H, W, 3)
+
+                # blended_img = foreground * alpha + background * (1 - alpha)
+                blended_img = foreground * alpha + vis_img * (1. - alpha)
+                blended_img = np.clip(blended_img, 0, 1)
+
+
+                plt.figure(figsize=(12, 8))
+                plt.imshow(blended_img)
+                plt.title(f"Correspondences")
+                # plt.axis('off')
+                # plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
+                # plt.close()
+                plt.draw()
+                plt.pause(5)
+
             # Predict relative transformation based on CMRNext correspondences
             # for iterative refinement
             cuda_pnp = cv2.pythoncuda.cudaPnP(obj_coord_zforward.astype(np.float32).copy(),
@@ -590,6 +650,9 @@ def evaluate_calibration(_config, seed):
 
                 axarr[0].imshow(viz_initial)
                 axarr[1].imshow(viz_final)
+                # f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
+                #           dpi=150)
+                # plt.close(f)
                 plt.draw()
                 plt.pause(5)
 
