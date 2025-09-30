@@ -154,8 +154,8 @@ def evaluate_calibration(_config, seed):
         f, axarr = plt.subplots(2, 1)
         axarr[0].set_title('Initial Calibration')
         axarr[1].set_title('CMRNext Estimated Calibration')
-        plt.show(block=False)
-        plt.pause(1)
+        # plt.show(block=False)
+        # plt.pause(1)
 
     _config['network'] = 'RAFT'
     _config['use_reflectance'] = checkpoint['config']['use_reflectance']
@@ -523,11 +523,11 @@ def evaluate_calibration(_config, seed):
                 plt.figure(figsize=(12, 8))
                 plt.imshow(blended_img)
                 plt.title(f"Correspondences")
-                # plt.axis('off')
-                # plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
-                # plt.close()
-                plt.draw()
-                plt.pause(5)
+                plt.axis('off')
+                plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
+                plt.close()
+                # plt.draw()
+                # plt.pause(5)
 
             # Predict relative transformation based on CMRNext correspondences
             # for iterative refinement
@@ -650,11 +650,11 @@ def evaluate_calibration(_config, seed):
 
                 axarr[0].imshow(viz_initial)
                 axarr[1].imshow(viz_final)
-                # f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
-                #           dpi=150)
-                # plt.close(f)
-                plt.draw()
-                plt.pause(5)
+                f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
+                          dpi=300)
+                plt.close(f)
+                # plt.draw()
+                # plt.pause(5)
 
             try:
                 if _config['dataset'] != 'custom':
