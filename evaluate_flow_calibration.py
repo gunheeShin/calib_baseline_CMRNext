@@ -42,6 +42,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 EPOCH = 1
 
+output_dir = 'output'
+
 
 def _init_fn(worker_id, seed):
     seed = seed + worker_id + EPOCH * 100
@@ -138,7 +140,7 @@ def downsample_and_pad(_config, rgb, depth_img_no_occlusion, img_shape, real_sha
 
 # noinspection PyUnreachableCode
 def evaluate_calibration(_config, seed):
-    global EPOCH
+    global EPOCH, output_dir
 
     np.random.seed(seed)
     torch.random.manual_seed(seed)
@@ -154,8 +156,9 @@ def evaluate_calibration(_config, seed):
         f, axarr = plt.subplots(2, 1)
         axarr[0].set_title('Initial Calibration')
         axarr[1].set_title('CMRNext Estimated Calibration')
-        os.makedirs('/ws/external/correspondence', exist_ok=True)
-        os.makedirs('/ws/external/output', exist_ok=True)
+        print("output_dir:", output_dir)
+        os.makedirs(os.path.join(output_dir, 'correspondence'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'output'), exist_ok=True)
         # plt.show(block=False)
         # plt.pause(1)
 
@@ -526,7 +529,8 @@ def evaluate_calibration(_config, seed):
                 plt.imshow(blended_img)
                 plt.title(f"Correspondences")
                 plt.axis('off')
-                plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
+                # plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
+                plt.savefig(os.path.join(output_dir, 'correspondence', 'comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png'), dpi=150)
                 plt.close()
                 # plt.draw()
                 # plt.pause(5)
@@ -652,7 +656,9 @@ def evaluate_calibration(_config, seed):
 
                 axarr[0].imshow(viz_initial)
                 axarr[1].imshow(viz_final)
-                f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
+                # f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
+                #           dpi=300)
+                f.savefig(os.path.join(output_dir, 'output', 'comparison_result_' + f'{idex}_' f'{iteration}_' + '.png'),
                           dpi=300)
                 plt.close(f)
                 # plt.draw()
@@ -817,9 +823,19 @@ def main():
     parser.add_argument('--quantile', type=float, default=1.0)
     parser.add_argument('--downsample', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--viz', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--dataset_name', type=str, default='KITTI')
+    parser.add_argument('--data_id', type=str, default='00')
+    parser.add_argument('--test_topics', type=str, default='default')
 
     args = parser.parse_args()
     _config = vars(args)
+
+    global output_dir
+    output_dir = os.path.join('/ws/output/', args.dataset_name, args.data_id, args.test_topics)
+    print(f"Results will be saved in {output_dir}")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
     evaluate_calibration(_config, _config['seed'])
 
 
