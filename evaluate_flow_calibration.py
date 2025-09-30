@@ -154,6 +154,8 @@ def evaluate_calibration(_config, seed):
         f, axarr = plt.subplots(2, 1)
         axarr[0].set_title('Initial Calibration')
         axarr[1].set_title('CMRNext Estimated Calibration')
+        os.makedirs('/ws/external/correspondence', exist_ok=True)
+        os.makedirs('/ws/external/output', exist_ok=True)
         # plt.show(block=False)
         # plt.pause(1)
 
