@@ -295,7 +295,7 @@ def main(gpu, _config, common_seed, world_size):
     torch.cuda.set_device(gpu)
     device = torch.device(gpu)
     print(f"Process {rank}, seed {common_seed}")
-    
+
     # Setup Weights&Biases
     wandb_run_id = 'remove'
     if _config['wandb'] and rank == 0:
@@ -316,7 +316,7 @@ def main(gpu, _config, common_seed, world_size):
     _config["savemodel"] = os.path.join(_config["savemodel"], wandb_run_id)
     if not os.path.exists(_config["savemodel"]) and rank == 0:
         os.mkdir(_config["savemodel"])
-    
+
     # Training and test set creation
     num_worker = _config['num_worker']
     batch_size = _config['batch_size']
@@ -338,11 +338,10 @@ def main(gpu, _config, common_seed, world_size):
             for name, param in model.named_parameters():
                 if 'update_block_unc' not in name:
                     param.requires_grad = False
-    
+
     model.train()
     model = DistributedDataParallel(model.to(device), device_ids=[rank], output_device=rank,
                                     find_unused_parameters=_config['find_unused_parameter'])
-
 
     # Setup Optimizer and Scheduler
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -377,104 +376,130 @@ def main(gpu, _config, common_seed, world_size):
     total_iter = 0
     for epoch in range(starting_epoch, _config['epochs']):
 
-        train_directories_kitti = []
-        for subdir in ['03', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19',
-                       '20', '21']:
-            train_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
-        train_directories_argo = []
-        base_dir = _config['data_folder_argo']
-        for subdir in ['train1', 'train2', 'train3']:
-            train_directories_argo.append(os.path.join(base_dir, subdir))
-        train_directories_pandaset = []
-        base_dir = _config['data_folder_panda']
-        for subdir in os.listdir(base_dir):
-            seq_num = int(subdir)
-            if (57 <= int(seq_num) <= 78) or int(seq_num) == 149:
-                continue
-            if subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
-                continue
-            train_directories_pandaset.append(os.path.join(base_dir, subdir))
+        if _config['custom']:
+            train_directories_custom = []
+            train_directories_custom.append(os.path.join(_config['data_folder_custom'], 'train'))
 
-        dataset_kitti = DatasetGeneralExtrinsicCalib(train_directories_kitti, train=True, max_r=_config['max_r'],
-                                                     max_t=_config['max_t'],
-                                                     use_reflectance=_config['use_reflectance'],
-                                                     normalize_images=_config['normalize_images'],
-                                                     dataset='kitti')
-        if not _config['kitti_only']:
-            dataset_argo = DatasetGeneralExtrinsicCalib(train_directories_argo, train=True, max_r=_config['max_r'],
-                                                        max_t=_config['max_t'],
-                                                        use_reflectance=_config['use_reflectance'],
-                                                        normalize_images=_config['normalize_images'],
-                                                        dataset='argoverse', cam='ring_front_center')
-            dataset_pandaset = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
-                                                             max_r=_config['max_r'], max_t=_config['max_t'],
-                                                             use_reflectance=_config['use_reflectance'],
-                                                             normalize_images=_config['normalize_images'],
-                                                             sensor_id=0, camera='front_camera')
-            dataset_pandaset2 = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
-                                                              max_r=_config['max_r'], max_t=_config['max_t'],
-                                                              use_reflectance=_config['use_reflectance'],
-                                                              normalize_images=_config['normalize_images'],
-                                                              sensor_id=1, camera='front_camera')
-            assert len(dataset_argo) != 0 and len(dataset_kitti) != 0 and len(dataset_pandaset) != 0 and len(
-                dataset_pandaset2) != 0, "Something wrong with the dataset"
+            dataset_custom = DatasetGeneralExtrinsicCalib(train_directories_custom, train=True, max_r=_config['max_r'],
+                                                         max_t=_config['max_t'],
+                                                         use_reflectance=_config['use_reflectance'],
+                                                         normalize_images=_config['normalize_images'],
+                                                         dataset='custom')
 
-        # print("Len Kitti Dataset: ", len(dataset_kitti))
-        # print("Len Argo Dataset: ", len(dataset_argo))
-        # print("Len Panda Dataset: ", 2*len(dataset_pandaset))
+            dataset_train = dataset_custom
 
-        if _config['kitti_only']:
-            dataset_train = dataset_kitti
         else:
-            kitti_idxs = np.arange(0, len(dataset_kitti))
-            np.random.shuffle(kitti_idxs)
-            dataset_kitti = torch.utils.data.Subset(dataset_kitti, kitti_idxs[:len(dataset_pandaset) * 2])
-            argo_idxs = np.arange(0, len(dataset_argo))
-            np.random.shuffle(argo_idxs)
-            dataset_argo = torch.utils.data.Subset(dataset_argo, argo_idxs[:len(dataset_pandaset) * 2])
-            dataset_train = torch.utils.data.ConcatDataset(
-                [dataset_argo, dataset_kitti, dataset_pandaset, dataset_pandaset2])
-            if len(dataset_train) != 36000 and rank == 0:
-                logger.warning(f"Dataset size is different than what is should be:\n"
-                               f"Expected size: 36000, Current size: {len(dataset_train)}")
+            train_directories_kitti = []
+            for subdir in ['03', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19',
+                           '20', '21']:
+                train_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
+            train_directories_argo = []
+            base_dir = _config['data_folder_argo']
+            for subdir in ['train1', 'train2', 'train3']:
+                train_directories_argo.append(os.path.join(base_dir, subdir))
+            train_directories_pandaset = []
+            base_dir = _config['data_folder_panda']
+            for subdir in os.listdir(base_dir):
+                seq_num = int(subdir)
+                if (57 <= int(seq_num) <= 78) or int(seq_num) == 149:
+                    continue
+                if subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
+                    continue
+                train_directories_pandaset.append(os.path.join(base_dir, subdir))
+
+            dataset_kitti = DatasetGeneralExtrinsicCalib(train_directories_kitti, train=True, max_r=_config['max_r'],
+                                                         max_t=_config['max_t'],
+                                                         use_reflectance=_config['use_reflectance'],
+                                                         normalize_images=_config['normalize_images'],
+                                                         dataset='kitti')
+            if not _config['kitti_only']:
+                dataset_argo = DatasetGeneralExtrinsicCalib(train_directories_argo, train=True, max_r=_config['max_r'],
+                                                            max_t=_config['max_t'],
+                                                            use_reflectance=_config['use_reflectance'],
+                                                            normalize_images=_config['normalize_images'],
+                                                            dataset='argoverse', cam='ring_front_center')
+                dataset_pandaset = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
+                                                                 max_r=_config['max_r'], max_t=_config['max_t'],
+                                                                 use_reflectance=_config['use_reflectance'],
+                                                                 normalize_images=_config['normalize_images'],
+                                                                 sensor_id=0, camera='front_camera')
+                dataset_pandaset2 = DatasetPandasetExtrinsicCalib(train_directories_pandaset, train=True,
+                                                                  max_r=_config['max_r'], max_t=_config['max_t'],
+                                                                  use_reflectance=_config['use_reflectance'],
+                                                                  normalize_images=_config['normalize_images'],
+                                                                  sensor_id=1, camera='front_camera')
+                assert len(dataset_argo) != 0 and len(dataset_kitti) != 0 and len(dataset_pandaset) != 0 and len(
+                    dataset_pandaset2) != 0, "Something wrong with the dataset"
+
+            # print("Len Kitti Dataset: ", len(dataset_kitti))
+            # print("Len Argo Dataset: ", len(dataset_argo))
+            # print("Len Panda Dataset: ", 2*len(dataset_pandaset))
+
+            if _config['kitti_only']:
+                dataset_train = dataset_kitti
+            else:
+                kitti_idxs = np.arange(0, len(dataset_kitti))
+                np.random.shuffle(kitti_idxs)
+                dataset_kitti = torch.utils.data.Subset(dataset_kitti, kitti_idxs[:len(dataset_pandaset) * 2])
+                argo_idxs = np.arange(0, len(dataset_argo))
+                np.random.shuffle(argo_idxs)
+                dataset_argo = torch.utils.data.Subset(dataset_argo, argo_idxs[:len(dataset_pandaset) * 2])
+                dataset_train = torch.utils.data.ConcatDataset(
+                    [dataset_argo, dataset_kitti, dataset_pandaset, dataset_pandaset2])
+                if len(dataset_train) != 36000 and rank == 0:
+                    logger.warning(f"Dataset size is different than what is should be:\n"
+                                   f"Expected size: 36000, Current size: {len(dataset_train)}")
 
         if epoch == starting_epoch:
             if starting_epoch == 0:
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
                                                                 epochs=_config['epochs'],
                                                                 steps_per_epoch=len(dataset_train) // (
-                                                                            batch_size * world_size),
+                                                                        batch_size * world_size),
                                                                 pct_start=0.4, div_factor=10,
                                                                 final_div_factor=100000)
             else:
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
                                                                 epochs=_config['epochs'] + 1,
                                                                 steps_per_epoch=len(dataset_train) // (
-                                                                            batch_size * world_size),
+                                                                        batch_size * world_size),
                                                                 pct_start=0.4, div_factor=10,
                                                                 final_div_factor=100000, last_epoch=starting_epoch * (
                             len(dataset_train) // (batch_size * world_size)))
             total_iter = starting_epoch * len(dataset_train)
 
-        test_directories_kitti = []
-        for subdir in ['00']:
-            test_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
-        test_directories_argo = []
-        base_dir = _config['data_folder_argo']
-        for subdir in ['train1', 'train2', 'train3']:
-            test_directories_argo.append(os.path.join(base_dir, subdir))
-        test_directories_pandaset = []
-        base_dir = _config['data_folder_panda']
-        for subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
-            test_directories_pandaset.append(os.path.join(base_dir, subdir))
+        if _config['custom']:
+            test_directories_custom = []
+            test_directories_custom.append(os.path.join(_config['data_folder_custom'], 'test'))
 
-        dataset_val_kitti = DatasetGeneralExtrinsicCalib(test_directories_kitti, train=False, max_r=_config['max_r'],
-                                                         max_t=_config['max_t'],
-                                                         use_reflectance=_config['use_reflectance'],
-                                                         normalize_images=_config['normalize_images'],
-                                                         dataset='kitti')
+            dataset_val_custom = DatasetGeneralExtrinsicCalib(test_directories_custom, train=True, max_r=_config['max_r'],
+                                                          max_t=_config['max_t'],
+                                                          use_reflectance=_config['use_reflectance'],
+                                                          normalize_images=_config['normalize_images'],
+                                                          dataset='custom')
 
-        dataset_val = dataset_val_kitti
+            dataset_val = dataset_val_custom
+
+        else:
+            test_directories_kitti = []
+            for subdir in ['00']:
+                test_directories_kitti.append(os.path.join(_config['data_folder_kitti'], subdir))
+            test_directories_argo = []
+            base_dir = _config['data_folder_argo']
+            for subdir in ['train1', 'train2', 'train3']:
+                test_directories_argo.append(os.path.join(base_dir, subdir))
+            test_directories_pandaset = []
+            base_dir = _config['data_folder_panda']
+            for subdir in ['011', '122', '124', '030', '109', '043', '084', '115', '090']:
+                test_directories_pandaset.append(os.path.join(base_dir, subdir))
+
+            dataset_val_kitti = DatasetGeneralExtrinsicCalib(test_directories_kitti, train=False, max_r=_config['max_r'],
+                                                             max_t=_config['max_t'],
+                                                             use_reflectance=_config['use_reflectance'],
+                                                             normalize_images=_config['normalize_images'],
+                                                             dataset='kitti')
+
+            dataset_val = dataset_val_kitti
 
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             dataset_train,
@@ -863,6 +888,8 @@ def real_main():
     parser.add_argument('--data_folder_argo', type=str, default='/media/DATA/ARGO/only_center_camera/')
     parser.add_argument('--data_folder_kitti', type=str, default='/home/cattaneod/Datasets/KITTI/sequences/')
     parser.add_argument('--data_folder_panda', type=str, default='/media/RAIDONE/DATASETS/pandaset')
+    parser.add_argument('--data_folder_custom', type=str, default='/ws/data/LG_Innotek/VIVID/CMRNext')
+    parser.add_argument('--custom', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--use_reflectance', action='store_true', default=False)
     parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--BASE_LEARNING_RATE', type=float, default=3e-4)
