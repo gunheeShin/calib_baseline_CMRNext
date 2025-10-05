@@ -378,7 +378,8 @@ def main(gpu, _config, common_seed, world_size):
 
         if _config['custom']:
             train_directories_custom = []
-            train_directories_custom.append(os.path.join(_config['data_folder_custom'], 'train'))
+            for subdir in ['campus_day2', 'campus_evening', 'city_day1', 'city_day2', 'city_evening']:
+                train_directories_custom.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'CMRNext'))
 
             dataset_custom = DatasetGeneralExtrinsicCalib(train_directories_custom, train=True, max_r=_config['max_r'],
                                                          max_t=_config['max_t'],
@@ -470,7 +471,8 @@ def main(gpu, _config, common_seed, world_size):
 
         if _config['custom']:
             test_directories_custom = []
-            test_directories_custom.append(os.path.join(_config['data_folder_custom'], 'test'))
+            for subdir in ['campus_day1']:
+                test_directories_custom.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'CMRNext'))
 
             dataset_val_custom = DatasetGeneralExtrinsicCalib(test_directories_custom, train=True, max_r=_config['max_r'],
                                                           max_t=_config['max_t'],
@@ -865,7 +867,7 @@ def main(gpu, _config, common_seed, world_size):
             old_save_filename = savefilename
 
         # Cleanup
-        del sample, dataset_kitti, dataset_train, dataset_val, TrainImgLoader
+        del sample, dataset_custom, dataset_train, dataset_val, TrainImgLoader
 
     if rank == 0:
         logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
