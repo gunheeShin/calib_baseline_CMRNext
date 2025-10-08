@@ -378,13 +378,14 @@ def main(gpu, _config, common_seed, world_size):
 
         if _config['custom']:
             train_directories_custom = []
-            train_directories_custom.append(os.path.join(_config['data_folder_custom'], 'train'))
+            for subdir in ['library_1', 'library_3', 'parking_lot_1', 'parking_lot_4', 'SC_1', 'SC_3', 'island_1', 'island_2']:
+                train_directories_custom.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'CMRNext'))
 
             dataset_custom = DatasetGeneralExtrinsicCalib(train_directories_custom, train=True, max_r=_config['max_r'],
                                                          max_t=_config['max_t'],
                                                          use_reflectance=_config['use_reflectance'],
                                                          normalize_images=_config['normalize_images'],
-                                                         dataset='custom')
+                                                         dataset='custom', sensor_type=_config['sensor_type'])
 
             dataset_train = dataset_custom
 
@@ -470,13 +471,14 @@ def main(gpu, _config, common_seed, world_size):
 
         if _config['custom']:
             test_directories_custom = []
-            test_directories_custom.append(os.path.join(_config['data_folder_custom'], 'test'))
+            for subdir in ['parking_lot_2']:
+                test_directories_custom.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'CMRNext'))
 
             dataset_val_custom = DatasetGeneralExtrinsicCalib(test_directories_custom, train=True, max_r=_config['max_r'],
                                                           max_t=_config['max_t'],
                                                           use_reflectance=_config['use_reflectance'],
                                                           normalize_images=_config['normalize_images'],
-                                                          dataset='custom')
+                                                          dataset='custom',sensor_type=_config['sensor_type'])
 
             dataset_val = dataset_val_custom
 
@@ -865,7 +867,7 @@ def main(gpu, _config, common_seed, world_size):
             old_save_filename = savefilename
 
         # Cleanup
-        del sample, dataset_kitti, dataset_train, dataset_val, TrainImgLoader
+        del sample, dataset_custom, dataset_train, dataset_val, TrainImgLoader
 
     if rank == 0:
         logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
@@ -926,6 +928,7 @@ def real_main():
     parser.add_argument('--finetune', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--find_unused_parameter', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--context_encoder', type=str, default="lidar", choices=["lidar"])
+    parser.add_argument('--sensor_type', type=str, default="lidar")
 
     args = parser.parse_args()
     # print(args)

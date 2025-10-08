@@ -173,7 +173,7 @@ def get_extrinsic_pandaset(camera):
 class DatasetGeneralExtrinsicCalib(Dataset):
 
     def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=2., max_r=10.,
-                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False,
+                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False, sensor_type='lidar',
                  camera_intrinsics=None):
         super(DatasetGeneralExtrinsicCalib, self).__init__()
         self.dataset = dataset
@@ -198,7 +198,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             self.extension = '.ply'
             self.sdbs = {}
         elif dataset == 'custom':
-            self.maps_folder = 'lidar'
+            self.maps_folder = sensor_type
             self.camera_folder = 'camera'
         self.all_files = []
 
