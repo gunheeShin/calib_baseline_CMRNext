@@ -257,7 +257,7 @@ def evaluate_calibration(_config, seed):
         dataset_val = DatasetGeneralExtrinsicCalib(val_directories, train=False, max_r=_config['max_r'],
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
                                                    normalize_images=_config['normalize_images'],
-                                                   dataset=_config['dataset'], cam=_config['cam'])
+                                                   dataset=_config['dataset'], cam=_config['cam'], sensor_type=_config['sensor_type'])
 
     def init_fn(x):
         return _init_fn(x, seed)
@@ -680,127 +680,92 @@ def evaluate_calibration(_config, seed):
         errors_t[iteration] = torch.tensor(errors_t[iteration])
         errors_r[iteration] = torch.tensor(errors_r[iteration])
 
-    if _config['dataset'] == 'custom' and len(final_calib_RTs[len(_config['weights'])]) == 1:
-        print("Predicted extrinsic calibration:")
-        print(final_calib_RTs[len(_config['weights'])][0])
-    elif _config['dataset'] == 'custom':
-        iteration = len(_config['weights'])
-        final_quats = np.stack([quaternion_from_matrix(t) for t in final_calib_RTs[iteration]])
-        avg_quaternion = torch.from_numpy(average_quaternions(final_quats))
-        median_quaternion = quaternion_median(torch.tensor(np.stack(final_quats)))
-        mode_quaternion = quaternion_mode(final_quats, 4)
-
-        avg_translation = torch.stack(final_calib_RTs[iteration])[:, :3, 3].mean(0)
-        median_translation = torch.stack(final_calib_RTs[iteration])[:, :3, 3].median(0)[0]
-        mode_translation = quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 2)
-
-        R = quat2mat(avg_quaternion)
-        T = tvector2mat(avg_translation)
-        avg_extrinsic_calib = torch.mm(T, R)
-        torch.set_printoptions(5, sci_mode=False)
-        print("Predicted extrinsic calibration using average aggregation:")
-        print(avg_extrinsic_calib)
-
-        R = quat2mat(median_quaternion)
-        T = tvector2mat(median_translation)
-        median_extrinsic_calib = torch.mm(T, R)
-        torch.set_printoptions(5, sci_mode=False)
-        print("Predicted extrinsic calibration using median aggregation:")
-        print(median_extrinsic_calib)
-
-        R = quat2mat(mode_quaternion)
-        T = tvector2mat(mode_translation)
-        mode_extrinsic_calib = torch.mm(T, R)
-        print("Predicted extrinsic calibration using mode aggregation:")
-        print(mode_extrinsic_calib)
-
-    else:
-        console = Console()
-        table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
-        table.title = f"CMRNext Results on {_config['dataset']}, camera {_config['cam']}"
-        table.add_column("Iteration")
-        table.add_column("Median Translation error (cm)", justify="center", max_width=20)
-        table.add_column("Median Rotation error (˚)", justify="center", max_width=20)
+    console = Console()
+    table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
+    table.title = f"CMRNext Results on {_config['dataset']}, camera {_config['cam']}"
+    table.add_column("Iteration")
+    table.add_column("Median Translation error (cm)", justify="center", max_width=20)
+    table.add_column("Median Rotation error (˚)", justify="center", max_width=20)
+    table.add_row(
+        f"Initial Pose",
+        f"{errors_t[0].median().item() * 100:.2f}",
+        f"{errors_r[0].median().item():.2f}"
+    )
+    for iteration in range(1, len(_config['weights']) + 1):
         table.add_row(
-            f"Initial Pose",
-            f"{errors_t[0].median().item() * 100:.2f}",
-            f"{errors_r[0].median().item():.2f}"
+            f"Iteration {iteration}",
+            f"{errors_t[iteration].median().item() * 100:.2f}",
+            f"{errors_r[iteration].median().item():.2f}"
         )
-        for iteration in range(1, len(_config['weights']) + 1):
-            table.add_row(
-                f"Iteration {iteration}",
-                f"{errors_t[iteration].median().item() * 100:.2f}",
-                f"{errors_r[iteration].median().item():.2f}"
-            )
-        print("")
-        print("")
-        console.print(table)
+    print("")
+    print("")
+    console.print(table)
 
-        table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
-        table.title = f"Temporal Aggregation Results on {_config['dataset']}"
-        table.add_column("Aggregation Measure", max_width=13)
-        table.add_column("Translation Error (cm)", justify="center")
-        table.add_column("Rotation Error (˚)", justify="center")
+    table = Table(show_header=True, header_style="bold magenta", box=box.MINIMAL_HEAVY_HEAD, title_style="bold red")
+    table.title = f"Temporal Aggregation Results on {_config['dataset']}"
+    table.add_column("Aggregation Measure", max_width=13)
+    table.add_column("Translation Error (cm)", justify="center")
+    table.add_column("Rotation Error (˚)", justify="center")
 
-        iteration = len(_config['weights'])
-        final_quats = np.stack([quaternion_from_matrix(t) for t in final_calib_RTs[iteration]])
-        r_error_avg = quaternion_distance(
-            torch.from_numpy(average_quaternions(final_quats)),
+    iteration = len(_config['weights'])
+    final_quats = np.stack([quaternion_from_matrix(t) for t in final_calib_RTs[iteration]])
+    r_error_avg = quaternion_distance(
+        torch.from_numpy(average_quaternions(final_quats)),
+        quaternion_from_matrix(sample['cam2vel'][0])
+    )
+    # r_error_median = quaternion_distance(
+    #     quaternion_median(np.stack(final_quats)),
+    #     quaternion_from_matrix(sample['cam2vel'][0])
+    # )
+    r_error_mode = quaternion_distance(
+        quaternion_mode(final_quats, 4),
+        quaternion_from_matrix(sample['cam2vel'][0])
+    )
+    if r_error_mode > quaternion_distance(
+            quaternion_mode(final_quats, 3),
             quaternion_from_matrix(sample['cam2vel'][0])
-        )
-        # r_error_median = quaternion_distance(
-        #     quaternion_median(np.stack(final_quats)),
-        #     quaternion_from_matrix(sample['cam2vel'][0])
-        # )
+    ):
         r_error_mode = quaternion_distance(
-            quaternion_mode(final_quats, 4),
+            quaternion_mode(final_quats, 3),
             quaternion_from_matrix(sample['cam2vel'][0])
         )
-        if r_error_mode > quaternion_distance(
-                quaternion_mode(final_quats, 3),
-                quaternion_from_matrix(sample['cam2vel'][0])
-        ):
-            r_error_mode = quaternion_distance(
-                quaternion_mode(final_quats, 3),
-                quaternion_from_matrix(sample['cam2vel'][0])
-            )
 
-        t_error_avg = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].mean(0)
-                       - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        t_error_median = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].median(0)[0]
-                          - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 2)
+    t_error_avg = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].mean(0)
+                   - sample['cam2vel'][0][:3, 3]).norm() * 100.
+    t_error_median = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].median(0)[0]
+                      - sample['cam2vel'][0][:3, 3]).norm() * 100.
+    t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 2)
+                    - sample['cam2vel'][0][:3, 3]).norm() * 100.
+    if t_error_mode > (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
+                       - sample['cam2vel'][0][:3, 3]).norm() * 100.:
+        t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
                         - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        if t_error_mode > (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
-                           - sample['cam2vel'][0][:3, 3]).norm() * 100.:
-            t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
-                            - sample['cam2vel'][0][:3, 3]).norm() * 100.
-        table.add_row(
-            "Mean",
-            f"[bold green]{t_error_avg.item():.2f}[/bold green]" if t_error_avg.item() <= t_error_median.item() and
-                                                                    t_error_avg.item() <= t_error_mode.item() else
-            f"{t_error_avg.item():.2f}",
-            f"[bold green]{r_error_avg:.2f}[/bold green]" if r_error_avg <= r_error_mode else
-            f"{r_error_avg:.2f}",
-        )
-        table.add_row(
-            "Median",
-            f"[bold green]{t_error_median.item():.2f}[/bold green]" if t_error_median.item() <= t_error_avg.item() and
-                                                                       t_error_median.item() <= t_error_mode.item() else
-            f"{t_error_median.item():.2f}",
-            f"---"
-        )
-        table.add_row(
-            "Mode",
-            f"[bold green]{t_error_mode.item():.2f}[/bold green]" if t_error_mode.item() <= t_error_avg.item() and
-                                                                     t_error_mode.item() <= t_error_median.item() else
-            f"{t_error_mode.item():.2f}",
-            f"[bold green]{r_error_mode:.2f}[/bold green]" if r_error_mode <= r_error_avg else
-            f"{r_error_mode:.2f}"
-        )
-        print("")
-        print("")
-        console.print(table)
+    table.add_row(
+        "Mean",
+        f"[bold green]{t_error_avg.item():.2f}[/bold green]" if t_error_avg.item() <= t_error_median.item() and
+                                                                t_error_avg.item() <= t_error_mode.item() else
+        f"{t_error_avg.item():.2f}",
+        f"[bold green]{r_error_avg:.2f}[/bold green]" if r_error_avg <= r_error_mode else
+        f"{r_error_avg:.2f}",
+    )
+    table.add_row(
+        "Median",
+        f"[bold green]{t_error_median.item():.2f}[/bold green]" if t_error_median.item() <= t_error_avg.item() and
+                                                                   t_error_median.item() <= t_error_mode.item() else
+        f"{t_error_median.item():.2f}",
+        f"---"
+    )
+    table.add_row(
+        "Mode",
+        f"[bold green]{t_error_mode.item():.2f}[/bold green]" if t_error_mode.item() <= t_error_avg.item() and
+                                                                 t_error_mode.item() <= t_error_median.item() else
+        f"{t_error_mode.item():.2f}",
+        f"[bold green]{r_error_mode:.2f}[/bold green]" if r_error_mode <= r_error_avg else
+        f"{r_error_mode:.2f}"
+    )
+    print("")
+    print("")
+    console.print(table)
 
     if _config['save_file'] is not None:
         torch.save(errors_t, f'./{_config["save_file"]}_errors_t.torch')
@@ -826,6 +791,8 @@ def main():
     parser.add_argument('--dataset_name', type=str, default='KITTI')
     parser.add_argument('--data_id', type=str, default='00')
     parser.add_argument('--test_topics', type=str, default='default')
+    parser.add_argument('--sensor_type', type=str, default='lidar')
+
 
     args = parser.parse_args()
     _config = vars(args)
