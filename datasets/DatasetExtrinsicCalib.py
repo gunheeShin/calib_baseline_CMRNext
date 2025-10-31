@@ -173,7 +173,7 @@ def get_extrinsic_pandaset(camera):
 class DatasetGeneralExtrinsicCalib(Dataset):
 
     def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=2., max_r=10.,
-                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False, sensor_type='lidar',
+                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False, sensor_type='lidar', downsample=False,
                  camera_intrinsics=None):
         super(DatasetGeneralExtrinsicCalib, self).__init__()
         self.dataset = dataset
@@ -199,7 +199,10 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             self.sdbs = {}
         elif dataset == 'custom':
             self.maps_folder = sensor_type
-            self.camera_folder = 'camera'
+            if downsample:
+                self.camera_folder = 'Downsample/camera'
+            else:
+                self.camera_folder = 'camera'
         self.all_files = []
 
         if not isinstance(dataset_dirs, list):
@@ -218,8 +221,12 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                         self.all_files.append(os.path.join(point_cloud_folder, filename))
 
             if dataset == 'custom':
-                with open(os.path.join(directory, 'calibration.yaml')) as f:
-                    file_data = yaml.safe_load(f)
+                if downsample:
+                    with open(os.path.join(directory, 'Downsample/calibration.yaml')) as f:
+                        file_data = yaml.safe_load(f)
+                else:
+                    with open(os.path.join(directory, 'calibration.yaml')) as f:
+                        file_data = yaml.safe_load(f)
                 self.camera_intrinsics = torch.tensor(
                     [file_data['fx'], file_data['fy'], file_data['cx'], file_data['cy']])
                 self.initial_extrinsic = torch.tensor(file_data['initial_extrinsic'], dtype=torch.float).reshape(4, 4)
@@ -286,6 +293,19 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             pc = self.point_cloud_reader(pc_path)
             cam2vel = self.initial_extrinsic
             calib = self.camera_intrinsics
+
+            if sensor_type == 'radar':
+                if pc.shape[0] == 0 or pc.shape[1] < 3:
+                    print(f"[WARNING] Empty or invalid point cloud at {pc_path}, resampling")
+                    new_idx = np.random.randint(0, self.__len__())
+                    return self.__getitem__(new_idx)
+                valid_mask = pc[:, 2] >= -1.0
+                if not np.any(valid_mask):
+                    print(f"[WARNING] All points below z=-1.0 for {pc_path}, resampling")
+                    new_idx = np.random.randint(0, self.__len__())
+                    return self.__getitem__(new_idx)
+                pc = pc[valid_mask]
+
             if pc.shape[1] == 3:
                 pc = np.concatenate((pc, np.ones((pc.shape[0], 1))), 1)
             elif pc.shape[1] >= 4:

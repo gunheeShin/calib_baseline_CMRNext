@@ -221,8 +221,12 @@ def evaluate_calibration(_config, seed):
                 f"Camera {_config['cam']} not supported for the {_config['dataset']} dataset"
     elif _config['dataset'] == 'custom':
         val_directories.append(base_dir)
-        first_camera_path = os.listdir(os.path.join(_config['data_folder'], 'camera'))[0]
-        first_camera_frame = np.asarray(Image.open(os.path.join(_config['data_folder'], 'camera', first_camera_path)))
+        if _config['downsize']:
+            first_camera_path = os.listdir(os.path.join(_config['data_folder'], 'Downsample/camera'))[0]
+            first_camera_frame = np.asarray(Image.open(os.path.join(_config['data_folder'], 'Downsample/camera', first_camera_path)))
+        else:
+            first_camera_path = os.listdir(os.path.join(_config['data_folder'], 'camera'))[0]
+            first_camera_frame = np.asarray(Image.open(os.path.join(_config['data_folder'], 'camera', first_camera_path)))
         img_shape = [first_camera_frame.shape[0], first_camera_frame.shape[1]]
         if _config['downsample']:
             img_shape = [img_shape[0] // 2, img_shape[1] // 2]
@@ -257,7 +261,7 @@ def evaluate_calibration(_config, seed):
         dataset_val = DatasetGeneralExtrinsicCalib(val_directories, train=False, max_r=_config['max_r'],
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
                                                    normalize_images=_config['normalize_images'],
-                                                   dataset=_config['dataset'], cam=_config['cam'], sensor_type=_config['sensor_type'])
+                                                   dataset=_config['dataset'], cam=_config['cam'], sensor_type=_config['sensor_type'], downsample=_config['downsize'])
 
     def init_fn(x):
         return _init_fn(x, seed)
@@ -379,6 +383,14 @@ def evaluate_calibration(_config, seed):
                 viz_initial = overlay_imgs(rgb, depth_img_no_occlusion[-1].unsqueeze(0).unsqueeze(0), max_depth=0.5,
                                            close_thr=1000)
                 # plt.imshow(viz_initial)
+                # f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
+                #           dpi=300)
+                plt.figure(figsize=(12, 8))
+                plt.imshow(viz_initial)
+                # plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
+                plt.savefig(os.path.join(output_dir, 'init',
+                                         'init_' + f'{idex}_.png'), dpi=150)
+                plt.close()
 
             points_3D = points_3D[new_indexes].clone()
             rgb, depth_img_no_occlusion, flow_img, flow_mask = downsample_and_pad(_config, rgb, depth_img_no_occlusion,
@@ -792,6 +804,7 @@ def main():
     parser.add_argument('--data_id', type=str, default='00')
     parser.add_argument('--test_topics', type=str, default='default')
     parser.add_argument('--sensor_type', type=str, default='lidar')
+    parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
 
 
     args = parser.parse_args()
