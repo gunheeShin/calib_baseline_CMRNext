@@ -393,7 +393,7 @@ class DatasetPandasetExtrinsicCalib(Dataset):
         self.normalize_images = normalize_images
         self.sensor_id = sensor_id
         self.maps_folder = 'lidar'
-        self.extension = 'pkl.gz'
+        self.extension = 'pkl'
         self.camera = camera
 
         self.all_files = []
@@ -444,9 +444,7 @@ class DatasetPandasetExtrinsicCalib(Dataset):
 
     def __getitem__(self, idx):
         pc_path = self.all_files[idx]
-        img_path = pc_path.replace('/' + self.maps_folder + '/', f'/camera/{self.camera}/').replace(self.extension,
-                                                                                                    'jpg')
-
+        img_path = pc_path.replace('/' + self.maps_folder + '/', f'/camera/{self.camera}/').replace(self.extension,'jpg')
         # Get the camera intrinsic parameters
         calib_file = os.path.dirname(img_path)
         calib_file = os.path.join(calib_file, 'intrinsics.json')
@@ -465,6 +463,7 @@ class DatasetPandasetExtrinsicCalib(Dataset):
             pc_in = pc_in[[2, 0, 1, 3], :]
 
         cam2vel = get_extrinsic_pandaset(self.camera)
+
 
         img = Image.open(img_path)
         h_mirror = False

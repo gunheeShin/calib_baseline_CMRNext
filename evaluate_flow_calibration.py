@@ -159,6 +159,7 @@ def evaluate_calibration(_config, seed):
         print("output_dir:", output_dir)
         os.makedirs(os.path.join(output_dir, 'correspondence'), exist_ok=True)
         os.makedirs(os.path.join(output_dir, 'output'), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, 'init'), exist_ok=True)
         # plt.show(block=False)
         # plt.pause(1)
 
