@@ -294,7 +294,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             cam2vel = self.initial_extrinsic
             calib = self.camera_intrinsics
 
-            if sensor_type == 'radar':
+            if self.maps_folder == 'radar':
                 if pc.shape[0] == 0 or pc.shape[1] < 3:
                     print(f"[WARNING] Empty or invalid point cloud at {pc_path}, resampling")
                     new_idx = np.random.randint(0, self.__len__())

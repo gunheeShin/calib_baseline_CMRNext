@@ -153,7 +153,7 @@ def evaluate_calibration(_config, seed):
     checkpoint = torch.load(_config['weights'][0], map_location='cpu')
 
     if _config['viz']:
-        f, axarr = plt.subplots(2, 1)
+        f, axarr = plt.subplots(1, 2)
         axarr[0].set_title('Initial Calibration')
         axarr[1].set_title('CMRNext Estimated Calibration')
         print("output_dir:", output_dir)
