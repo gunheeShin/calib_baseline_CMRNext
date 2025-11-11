@@ -1,4 +1,5 @@
 import argparse
+import gc
 import math
 import os
 import random
@@ -138,6 +139,30 @@ def downsample_and_pad(_config, rgb, depth_img_no_occlusion, img_shape, real_sha
     return rgb, depth_img_no_occlusion, flow_img, flow_mask
 
 
+def _to_numpy_image(image):
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu()
+        if image.dim() == 3 and image.shape[0] in (1, 3, 4):
+            image = image.permute(1, 2, 0)
+        return image.numpy()
+    return np.asarray(image)
+
+
+def _save_viz_image(image, save_path, title=None, figsize=(12, 8), dpi=150):
+    np_image = _to_numpy_image(image)
+    np_image = np.clip(np_image, 0.0, 1.0)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(np_image)
+    ax.axis('off')
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=dpi)
+    plt.close(fig)
+    del fig, ax, np_image
+    gc.collect()
+
+
 # noinspection PyUnreachableCode
 def evaluate_calibration(_config, seed):
     global EPOCH, output_dir
@@ -153,9 +178,6 @@ def evaluate_calibration(_config, seed):
     checkpoint = torch.load(_config['weights'][0], map_location='cpu')
 
     if _config['viz']:
-        f, axarr = plt.subplots(1, 2)
-        axarr[0].set_title('Initial Calibration')
-        axarr[1].set_title('CMRNext Estimated Calibration')
         print("output_dir:", output_dir)
         os.makedirs(os.path.join(output_dir, 'correspondence'), exist_ok=True)
         os.makedirs(os.path.join(output_dir, 'output'), exist_ok=True)
@@ -383,15 +405,13 @@ def evaluate_calibration(_config, seed):
             if _config['viz']:
                 viz_initial = overlay_imgs(rgb, depth_img_no_occlusion[-1].unsqueeze(0).unsqueeze(0), max_depth=0.5,
                                            close_thr=1000)
-                # plt.imshow(viz_initial)
-                # f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
-                #           dpi=300)
-                plt.figure(figsize=(12, 8))
-                plt.imshow(viz_initial)
-                # plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
-                plt.savefig(os.path.join(output_dir, 'init',
-                                         'init_' + f'{idex}_.png'), dpi=150)
-                plt.close()
+                viz_initial_np = _to_numpy_image(viz_initial)
+                _save_viz_image(viz_initial_np,
+                                os.path.join(output_dir, 'init', f'init_{idex}_.png'),
+                                title='Initial Calibration')
+                del viz_initial
+            else:
+                viz_initial_np = None
 
             points_3D = points_3D[new_indexes].clone()
             rgb, depth_img_no_occlusion, flow_img, flow_mask = downsample_and_pad(_config, rgb, depth_img_no_occlusion,
@@ -537,14 +557,11 @@ def evaluate_calibration(_config, seed):
                 blended_img = foreground * alpha + vis_img * (1. - alpha)
                 blended_img = np.clip(blended_img, 0, 1)
 
-
-                plt.figure(figsize=(12, 8))
-                plt.imshow(blended_img)
-                plt.title(f"Correspondences")
-                plt.axis('off')
-                # plt.savefig('/ws/external/correspondence/comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png', dpi=150)
-                plt.savefig(os.path.join(output_dir, 'correspondence', 'comparison_result_'  + f'{idex}_' f'{iteration}_'+ '.png'), dpi=150)
-                plt.close()
+                _save_viz_image(blended_img,
+                                os.path.join(output_dir, 'correspondence',
+                                             f'comparison_result_{idex}_{iteration}.png'),
+                                title='Correspondences')
+                del overlay_img, alpha, foreground, blended_img, vis_img, points_2d_before
                 # plt.draw()
                 # plt.pause(5)
 
@@ -666,16 +683,23 @@ def evaluate_calibration(_config, seed):
                 lidar_flow = new_depth_img_no_occlusion.unsqueeze(0).unsqueeze(0)
                 viz_final = overlay_imgs(sample['rgb'][idx].cuda(), lidar_flow, max_depth=_config['max_depth'] / 2,
                                          close_thr=1000)
-
-                axarr[0].imshow(viz_initial)
-                axarr[1].imshow(viz_final)
-                # f.savefig('/ws/external/output/comparison_result_' + f'{idex}_' f'{iteration}_' + '.png',
-                #           dpi=300)
-                f.savefig(os.path.join(output_dir, 'output', 'comparison_result_' + f'{idex}_' f'{iteration}_' + '.png'),
-                          dpi=300)
-                plt.close(f)
-                # plt.draw()
-                # plt.pause(5)
+                viz_final_np = _to_numpy_image(viz_final)
+                comparison_fig, comparison_axes = plt.subplots(1, 2, figsize=(12, 8))
+                comparison_axes[0].imshow(viz_initial_np if viz_initial_np is not None else viz_final_np)
+                comparison_axes[0].set_title('Initial Calibration')
+                comparison_axes[0].axis('on')
+                comparison_axes[1].imshow(viz_final_np)
+                comparison_axes[1].set_title('CMRNext Estimated Calibration')
+                comparison_axes[1].axis('on')
+                comparison_fig.tight_layout()
+                comparison_fig.savefig(
+                    os.path.join(output_dir, 'output', f'comparison_result_{idex}_{iteration}.png'),
+                    dpi=300
+                )
+                plt.close(comparison_fig)
+                del comparison_fig, comparison_axes, viz_final, viz_final_np, new_depth_img, new_depth_img_no_occlusion, lidar_flow
+                gc.collect()
+                viz_initial_np = None
 
             try:
                 if _config['dataset'] != 'custom':
