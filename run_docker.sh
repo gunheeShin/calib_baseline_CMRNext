@@ -8,6 +8,7 @@ docker run -it --rm \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
     -e NVIDIA_VISIBLE_DEVICES=all \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
-    -v $(realpath ../cmrnext):/ws/external \
-    -v /media/LTDataset:/ws/data \
-    wanheekim/cmrnext:latest
+    --mount type=bind,source=$(realpath ../calib_baseline_CMRNext),target=/ws/external \
+    --mount type=bind,source=/media/chan/LGIT_chan/Dataset/LG_Innotek/PublicDataset/,target=/ws/data \
+    --mount type=bind,source=/home/chan/Documents/Project/LG_Innotek/CMRNext/output,target=/ws/output \
+    cmrnext:latest

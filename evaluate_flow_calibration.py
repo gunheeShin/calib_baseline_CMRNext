@@ -163,6 +163,187 @@ def _save_viz_image(image, save_path, title=None, figsize=(12, 8), dpi=150):
     gc.collect()
 
 
+def _create_height_overlay_map(uv, depth_values, cam_params, image_shape, clip_percentiles=(2, 98)):
+    """
+    Build a 1x1xH xW tensor containing normalized heights so overlay_imgs can colorize by height.
+    """
+    if uv is None or depth_values is None:
+        return None
+    if uv.numel() == 0 or depth_values.numel() == 0:
+        return None
+
+    height, width = image_shape[0], image_shape[1]
+    uv_int = uv.long()
+    uv_float = uv.float()
+
+    fy = cam_params[1]
+    cy = cam_params[3]
+
+    heights = (uv_float[:, 1] - cy) * depth_values / fy
+
+    height_img = torch.zeros((height, width), device=uv.device, dtype=torch.float32)
+    valid_mask = torch.zeros_like(height_img, dtype=torch.bool)
+
+    v_coords = uv_int[:, 1]
+    u_coords = uv_int[:, 0]
+    height_img[v_coords, u_coords] = heights
+    valid_mask[v_coords, u_coords] = True
+
+    heights_cpu = heights.detach().cpu().numpy()
+    if heights_cpu.size == 0:
+        return height_img.unsqueeze(0).unsqueeze(0)
+
+    low_percentile, high_percentile = clip_percentiles
+    lower = np.percentile(heights_cpu, low_percentile)
+    upper = np.percentile(heights_cpu, high_percentile)
+    if not np.isfinite(lower):
+        lower = heights_cpu.min()
+    if not np.isfinite(upper):
+        upper = heights_cpu.max()
+    if upper - lower < 1e-4:
+        upper = lower + 1e-4
+
+    normalized_map = torch.zeros_like(height_img, dtype=torch.float32)
+    normalized_values = (height_img[valid_mask] - lower) / (upper - lower)
+    normalized_values = torch.clamp(normalized_values, 0., 1.)
+    # Prevent valid pixels from being rounded to zero when converted to uint8.
+    eps = 1.0 / 128.0
+    normalized_values = normalized_values * (1.0 - eps) + eps
+    normalized_map[valid_mask] = normalized_values
+
+    return normalized_map.unsqueeze(0).unsqueeze(0)
+
+
+def _visualize_temporal_aggregation(dataset, aggregation_rt, _config, seed, mean_torch, std_torch):
+    if aggregation_rt is None or dataset is None:
+        print("[viz_aggregation] Skipping visualization: no aggregated pose available.")
+        return
+
+    save_dir = os.path.join(output_dir, 'aggregation')
+    os.makedirs(save_dir, exist_ok=True)
+
+    def init_fn(worker_id):
+        return _init_fn(worker_id, seed)
+
+    agg_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                             shuffle=False,
+                                             batch_size=1,
+                                             num_workers=_config['num_worker'],
+                                             worker_init_fn=init_fn,
+                                             collate_fn=merge_inputs,
+                                             drop_last=False,
+                                             pin_memory=False)
+
+    aggregation_rt = aggregation_rt.to(device).float()
+    frame_counter = 0
+    color_by_height = _config.get('color_height', False)
+
+    with torch.no_grad():
+        fixed_tr_error = None
+        fixed_rot_error = None
+        for sample in tqdm(agg_loader, desc='Temporal aggregation visualization', leave=False):
+            if _config['fix_rt']:
+                if fixed_tr_error is None:
+                    fixed_tr_error = sample['tr_error'].clone()
+                    fixed_rot_error = sample['rot_error'].clone()
+                else:
+                    sample['tr_error'] = fixed_tr_error.clone()
+                    sample['rot_error'] = fixed_rot_error.clone()
+            sample['tr_error'] = sample['tr_error'].cuda()
+            sample['rot_error'] = sample['rot_error'].cuda()
+
+            for idx in range(len(sample['rgb'])):
+                # check if rot_error[idx] is in the correct format
+                rot_err = sample['rot_error'][idx]
+                # quaternion_distance expects a 1D quaternion tensor
+                if rot_err.dim() > 1:
+                    rot_err = rot_err.squeeze()
+                    
+                real_shape = [sample['rgb'][idx].shape[0], sample['rgb'][idx].shape[1], sample['rgb'][idx].shape[2]]
+
+                point_cloud = sample['point_cloud'][idx].cuda()
+                if _config['max_depth'] < 100.:
+                    point_cloud = point_cloud[:, point_cloud[0, :] < _config['max_depth']]
+
+                reflectance = None
+                if _config['use_reflectance']:
+                    reflectance = sample['reflectance'][idx].cuda()
+
+                cam_params = sample['calib'][idx].cuda()
+                cam_model = CameraModel()
+                cam_model.focal_length = cam_params[:2]
+                cam_model.principal_point = cam_params[2:]
+
+                R = quat2mat(sample['rot_error'][idx])
+                T = tvector2mat(sample['tr_error'][idx])
+                initial_pose = torch.mm(T, R).inverse()
+                pc_initial = rotate_forward(point_cloud.clone(), initial_pose)
+                init_depth_img, init_uv, init_indexes, init_depth_vals = prepare_input(
+                    cam_params, pc_initial, real_shape, reflectance, _config)
+                init_depth_valid = init_depth_vals[init_indexes]
+
+                cam2vel = sample['cam2vel'][idx].cuda().float()
+                pc_vel = rotate_forward(point_cloud.clone(), cam2vel)
+                pc_agg = rotate_back(pc_vel.clone(), aggregation_rt)
+                agg_depth_img, agg_uv, agg_indexes, agg_depth_vals = prepare_input(
+                    cam_params, pc_agg, real_shape, reflectance, _config)
+                agg_depth_valid = agg_depth_vals[agg_indexes]
+
+                rgb = sample['rgb'][idx].cuda()
+                rgb = rgb / 255.
+                if _config['normalize_images']:
+                    rgb = (rgb - mean_torch) / std_torch
+                rgb = rgb.permute(2, 0, 1)
+
+                if color_by_height:
+                    init_height_overlay = _create_height_overlay_map(init_uv.clone(), init_depth_valid,
+                                                                     cam_params, real_shape)
+                    agg_height_overlay = _create_height_overlay_map(agg_uv.clone(), agg_depth_valid,
+                                                                    cam_params, real_shape)
+                else:
+                    init_height_overlay = None
+                    agg_height_overlay = None
+
+                init_overlay = init_height_overlay if init_height_overlay is not None \
+                    else init_depth_img[-1].unsqueeze(0).unsqueeze(0)
+                init_max_depth = 1.0 if init_height_overlay is not None else 0.5
+
+                agg_overlay = agg_height_overlay if agg_height_overlay is not None \
+                    else agg_depth_img[-1].unsqueeze(0).unsqueeze(0)
+                agg_max_depth = 1.0 if agg_height_overlay is not None else (_config['max_depth'] / 2)
+
+                viz_initial = overlay_imgs(rgb, init_overlay, max_depth=init_max_depth, close_thr=1000)
+                viz_aggregated = overlay_imgs(rgb, agg_overlay, max_depth=agg_max_depth, close_thr=1000)
+
+                viz_initial_np = _to_numpy_image(viz_initial)
+                viz_aggregated_np = _to_numpy_image(viz_aggregated)
+
+                fig, axes = plt.subplots(1, 2, figsize=(12, 8))
+                axes[0].imshow(viz_initial_np)
+                axes[0].set_title('Initial Calibration')
+                axes[0].axis('off')
+                axes[1].imshow(viz_aggregated_np)
+                axes[1].set_title('Temporal Aggregation (Mean)')
+                axes[1].axis('off')
+                fig.tight_layout()
+
+                base_name = f'frame_{frame_counter:06d}'
+                if 'rgb_name' in sample:
+                    rgb_entry = sample['rgb_name']
+                    if isinstance(rgb_entry, (list, tuple)):
+                        rgb_candidate = rgb_entry[idx]
+                    else:
+                        rgb_candidate = rgb_entry
+                    if isinstance(rgb_candidate, str):
+                        base_name = os.path.splitext(os.path.basename(rgb_candidate))[0]
+
+                fig.savefig(os.path.join(save_dir, f'aggregation_result_{base_name}.png'), dpi=300)
+                plt.close(fig)
+                frame_counter += 1
+
+                del (pc_initial, pc_vel, pc_agg, init_depth_img, agg_depth_img, viz_initial, viz_aggregated,
+                     viz_initial_np, viz_aggregated_np)
+            gc.collect()
 # noinspection PyUnreachableCode
 def evaluate_calibration(_config, seed):
     global EPOCH, output_dir
@@ -333,15 +514,32 @@ def evaluate_calibration(_config, seed):
         final_calib_RTs.append([])
     tbar = tqdm(TestImgLoader)
     idex = 0
+    # first frame initial pose error
+    fixed_tr_error = None
+    fixed_rot_error = None
     for batch_idx, sample in enumerate(tbar):
         idex += 1
         lidar_input = []
         rgb_input = []
+        if _config['fix_rt']:
+            if batch_idx == 0:
+                fixed_tr_error = sample['tr_error'].clone()
+                fixed_rot_error = sample['rot_error'].clone()
+                print(f"fixed_tr_error: {fixed_tr_error}")
+                print(f"fixed_rot_error: {fixed_rot_error}")
+            else:
+                sample['tr_error'] = fixed_tr_error.clone()
+                sample['rot_error'] = fixed_rot_error.clone()
 
         sample['tr_error'] = sample['tr_error'].cuda()
         sample['rot_error'] = sample['rot_error'].cuda()
 
         for idx in range(len(sample['rgb'])):
+            # check if rot_error[idx] is in the correct format
+            rot_err = sample['rot_error'][idx]
+            # quaternion_distance expects a 1D quaternion tensor
+            if rot_err.dim() > 1:
+                rot_err = rot_err.squeeze()
             errors_r[0].append(quaternion_distance(sample['rot_error'][idx],
                                                    torch.tensor([1., 0., 0., 0.], device=sample['rot_error'].device)))
 
@@ -375,11 +573,17 @@ def evaluate_calibration(_config, seed):
             cam_params = sample['calib'][idx].cuda()
             depth_img_no_occlusion, uv, indexes, depth = prepare_input(cam_params, pc_rotated, real_shape,
                                                                        reflectance, _config)
+            depth_valid = depth[indexes]
+            if _config['viz'] and _config.get('color_height', False):
+                initial_height_overlay = _create_height_overlay_map(
+                    uv.clone(), depth_valid, cam_params, real_shape)
+            else:
+                initial_height_overlay = None
             cam_model = CameraModel()
             cam_model.focal_length = cam_params[:2]
             cam_model.principal_point = cam_params[2:]
 
-            flow, points_3D, new_indexes = get_flow_zforward(uv.float(), depth[indexes], RT1_inv, cam_model,
+            flow, points_3D, new_indexes = get_flow_zforward(uv.float(), depth_valid, RT1_inv, cam_model,
                                                              [real_shape[0], real_shape[1], 3],
                                                              scale_flow=False, reverse=False,
                                                              get_valid_indexes=True)
@@ -403,8 +607,18 @@ def evaluate_calibration(_config, seed):
             flow_mask[uv[:, 1], uv[:, 0]] = 1
 
             if _config['viz']:
-                viz_initial = overlay_imgs(rgb, depth_img_no_occlusion[-1].unsqueeze(0).unsqueeze(0), max_depth=0.5,
-                                           close_thr=1000)
+                if _config.get('color_height', False) and initial_height_overlay is not None:
+                    lidar_for_overlay = initial_height_overlay
+                    overlay_max_depth = 1.0
+                else:
+                    lidar_for_overlay = depth_img_no_occlusion[-1].unsqueeze(0).unsqueeze(0)
+                    overlay_max_depth = 0.5
+                viz_initial = overlay_imgs(
+                    rgb,
+                    lidar_for_overlay,
+                    max_depth=overlay_max_depth,
+                    close_thr=1000
+                )
                 viz_initial_np = _to_numpy_image(viz_initial)
                 _save_viz_image(viz_initial_np,
                                 os.path.join(output_dir, 'init', f'init_{idex}_.png'),
@@ -639,8 +853,13 @@ def evaluate_calibration(_config, seed):
 
             depth_img_no_occlusion, uv, indexes, depth = prepare_input(cam_params, rotated_point_cloud, real_shape,
                                                                        reflectance, _config)
+            depth_valid_next = depth[indexes]
+            final_height_overlay = None
+            if _config['viz'] and _config.get('color_height', False) and iteration == len(_config['weights']) - 1:
+                final_height_overlay = _create_height_overlay_map(
+                    uv.clone(), depth_valid_next, cam_params, real_shape)
 
-            flow, points_3D, new_indexes = get_flow_zforward(uv.float(), depth[indexes], extrinsic_error[-1].inverse(),
+            flow, points_3D, new_indexes = get_flow_zforward(uv.float(), depth_valid_next, extrinsic_error[-1].inverse(),
                                                              cam_model, [real_shape[0], real_shape[1], 3],
                                                              scale_flow=False, reverse=False,
                                                              get_valid_indexes=True)
@@ -680,9 +899,18 @@ def evaluate_calibration(_config, seed):
                                                                     _config['occlusion_threshold'],
                                                                     _config['occlusion_kernel'])
 
-                lidar_flow = new_depth_img_no_occlusion.unsqueeze(0).unsqueeze(0)
-                viz_final = overlay_imgs(sample['rgb'][idx].cuda(), lidar_flow, max_depth=_config['max_depth'] / 2,
-                                         close_thr=1000)
+                if _config.get('color_height', False) and final_height_overlay is not None:
+                    lidar_flow = final_height_overlay
+                    overlay_max_depth = 1.0
+                else:
+                    lidar_flow = new_depth_img_no_occlusion.unsqueeze(0).unsqueeze(0)
+                    overlay_max_depth = _config['max_depth'] / 2
+                viz_final = overlay_imgs(
+                    sample['rgb'][idx].cuda(),
+                    lidar_flow,
+                    max_depth=overlay_max_depth,
+                    close_thr=1000
+                )
                 viz_final_np = _to_numpy_image(viz_final)
                 comparison_fig, comparison_axes = plt.subplots(1, 2, figsize=(12, 8))
                 comparison_axes[0].imshow(viz_initial_np if viz_initial_np is not None else viz_final_np)
@@ -745,64 +973,73 @@ def evaluate_calibration(_config, seed):
     table.add_column("Rotation Error (˚)", justify="center")
 
     iteration = len(_config['weights'])
-    final_quats = np.stack([quaternion_from_matrix(t) for t in final_calib_RTs[iteration]])
-    r_error_avg = quaternion_distance(
-        torch.from_numpy(average_quaternions(final_quats)),
-        quaternion_from_matrix(sample['cam2vel'][0])
-    )
-    # r_error_median = quaternion_distance(
-    #     quaternion_median(np.stack(final_quats)),
-    #     quaternion_from_matrix(sample['cam2vel'][0])
-    # )
-    r_error_mode = quaternion_distance(
-        quaternion_mode(final_quats, 4),
-        quaternion_from_matrix(sample['cam2vel'][0])
-    )
-    if r_error_mode > quaternion_distance(
-            quaternion_mode(final_quats, 3),
-            quaternion_from_matrix(sample['cam2vel'][0])
-    ):
-        r_error_mode = quaternion_distance(
-            quaternion_mode(final_quats, 3),
+    aggregation_pose = None
+    final_stack = torch.stack(final_calib_RTs[iteration]) if len(final_calib_RTs[iteration]) > 0 else None
+    if final_stack is not None:
+        final_quats = np.stack([quaternion_from_matrix(t) for t in final_calib_RTs[iteration]])
+        avg_quat_np = average_quaternions(final_quats)
+        avg_quat_tensor = torch.from_numpy(avg_quat_np)
+        aggregation_pose = quat2mat(avg_quat_tensor.float())
+        aggregation_pose[:3, 3] = final_stack[:, :3, 3].mean(0)
+
+        r_error_avg = quaternion_distance(
+            avg_quat_tensor,
             quaternion_from_matrix(sample['cam2vel'][0])
         )
+        r_error_mode = quaternion_distance(
+            quaternion_mode(final_quats, 4),
+            quaternion_from_matrix(sample['cam2vel'][0])
+        )
+        if r_error_mode > quaternion_distance(
+                quaternion_mode(final_quats, 3),
+                quaternion_from_matrix(sample['cam2vel'][0])
+        ):
+            r_error_mode = quaternion_distance(
+                quaternion_mode(final_quats, 3),
+                quaternion_from_matrix(sample['cam2vel'][0])
+            )
 
-    t_error_avg = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].mean(0)
-                   - sample['cam2vel'][0][:3, 3]).norm() * 100.
-    t_error_median = (torch.stack(final_calib_RTs[iteration])[:, :3, 3].median(0)[0]
-                      - sample['cam2vel'][0][:3, 3]).norm() * 100.
-    t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 2)
-                    - sample['cam2vel'][0][:3, 3]).norm() * 100.
-    if t_error_mode > (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
-                       - sample['cam2vel'][0][:3, 3]).norm() * 100.:
-        t_error_mode = (quaternion_mode(torch.stack(final_calib_RTs[iteration])[:, :3, 3], 1)
+        t_error_avg = (final_stack[:, :3, 3].mean(0)
+                       - sample['cam2vel'][0][:3, 3]).norm() * 100.
+        t_error_median = (final_stack[:, :3, 3].median(0)[0]
+                          - sample['cam2vel'][0][:3, 3]).norm() * 100.
+        t_error_mode = (quaternion_mode(final_stack[:, :3, 3], 2)
                         - sample['cam2vel'][0][:3, 3]).norm() * 100.
-    table.add_row(
-        "Mean",
-        f"[bold green]{t_error_avg.item():.2f}[/bold green]" if t_error_avg.item() <= t_error_median.item() and
-                                                                t_error_avg.item() <= t_error_mode.item() else
-        f"{t_error_avg.item():.2f}",
-        f"[bold green]{r_error_avg:.2f}[/bold green]" if r_error_avg <= r_error_mode else
-        f"{r_error_avg:.2f}",
-    )
-    table.add_row(
-        "Median",
-        f"[bold green]{t_error_median.item():.2f}[/bold green]" if t_error_median.item() <= t_error_avg.item() and
-                                                                   t_error_median.item() <= t_error_mode.item() else
-        f"{t_error_median.item():.2f}",
-        f"---"
-    )
-    table.add_row(
-        "Mode",
-        f"[bold green]{t_error_mode.item():.2f}[/bold green]" if t_error_mode.item() <= t_error_avg.item() and
-                                                                 t_error_mode.item() <= t_error_median.item() else
-        f"{t_error_mode.item():.2f}",
-        f"[bold green]{r_error_mode:.2f}[/bold green]" if r_error_mode <= r_error_avg else
-        f"{r_error_mode:.2f}"
-    )
-    print("")
-    print("")
-    console.print(table)
+        if t_error_mode > (quaternion_mode(final_stack[:, :3, 3], 1)
+                           - sample['cam2vel'][0][:3, 3]).norm() * 100.:
+            t_error_mode = (quaternion_mode(final_stack[:, :3, 3], 1)
+                            - sample['cam2vel'][0][:3, 3]).norm() * 100.
+        table.add_row(
+            "Mean",
+            f"[bold green]{t_error_avg.item():.2f}[/bold green]" if t_error_avg.item() <= t_error_median.item() and
+                                                                    t_error_avg.item() <= t_error_mode.item() else
+            f"{t_error_avg.item():.2f}",
+            f"[bold green]{r_error_avg:.2f}[/bold green]" if r_error_avg <= r_error_mode else
+            f"{r_error_avg:.2f}",
+        )
+        table.add_row(
+            "Median",
+            f"[bold green]{t_error_median.item():.2f}[/bold green]" if t_error_median.item() <= t_error_avg.item() and
+                                                                       t_error_median.item() <= t_error_mode.item() else
+            f"{t_error_median.item():.2f}",
+            f"---"
+        )
+        table.add_row(
+            "Mode",
+            f"[bold green]{t_error_mode.item():.2f}[/bold green]" if t_error_mode.item() <= t_error_avg.item() and
+                                                                     t_error_mode.item() <= t_error_median.item() else
+            f"{t_error_mode.item():.2f}",
+            f"[bold green]{r_error_mode:.2f}[/bold green]" if r_error_mode <= r_error_avg else
+            f"{r_error_mode:.2f}"
+        )
+        print("")
+        print("")
+        console.print(table)
+    else:
+        print("[Temporal Aggregation] No final calibration estimates were collected; skipping summary table.")
+
+    if _config.get('viz_aggregation', False):
+        _visualize_temporal_aggregation(dataset_val, aggregation_pose, _config, seed, mean_torch, std_torch)
 
     if _config['save_file'] is not None:
         torch.save(errors_t, f'./{_config["save_file"]}_errors_t.torch')
@@ -816,6 +1053,7 @@ def main():
     parser.add_argument('--cam', type=str, nargs='?', default=None)
     parser.add_argument('--max_t', type=float, default=1.5)
     parser.add_argument('--max_r', type=float, default=20.)
+    parser.add_argument('--fix_rt', type=str2bool, nargs='?', const=True, default=False) # fix initial RT error by using the first frame
     parser.add_argument('--num_worker', type=int, default=2)
     parser.add_argument('--weights', type=str, nargs='+', default=None)
     parser.add_argument('--img_shape', type=int, nargs=1, default=2)
@@ -825,11 +1063,15 @@ def main():
     parser.add_argument('--quantile', type=float, default=1.0)
     parser.add_argument('--downsample', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--viz', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--viz_aggregation', type=str2bool, nargs='?', const=True, default=False,
+                        help='Visualize per-frame projections using temporal aggregation results.')
     parser.add_argument('--dataset_name', type=str, default='KITTI')
     parser.add_argument('--data_id', type=str, default='00')
     parser.add_argument('--test_topics', type=str, default='default')
     parser.add_argument('--sensor_type', type=str, default='lidar')
     parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--color_height', type=str2bool, nargs='?', const=True, default=False,
+                        help='Color lidar projections by height instead of depth in visualizations.')
 
 
     args = parser.parse_args()

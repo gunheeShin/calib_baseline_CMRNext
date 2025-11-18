@@ -352,6 +352,12 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             pc_in = rotate_forward(pc_in, R, T)
 
         max_angle = self.max_r
+        # rotz = np.random.uniform(max_angle, max_angle) * (3.141592 / 180.0)
+        # roty = np.random.uniform(max_angle, max_angle) * (3.141592 / 180.0)
+        # rotx = np.random.uniform(max_angle, max_angle) * (3.141592 / 180.0)
+        # transl_x = np.random.uniform(self.max_t, self.max_t)
+        # transl_y = np.random.uniform(self.max_t, self.max_t)
+        # transl_z = np.random.uniform(self.max_t, min(self.max_t, 1.))
         rotz = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
         roty = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
         rotx = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
