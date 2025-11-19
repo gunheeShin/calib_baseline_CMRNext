@@ -174,7 +174,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
 
     def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=2., max_r=10.,
                  train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False, sensor_type='lidar', downsample=False,
-                 camera_intrinsics=None):
+                 camera_intrinsics=None, quantitative_eval_error=False):
         super(DatasetGeneralExtrinsicCalib, self).__init__()
         self.dataset = dataset
         self.use_reflectance = use_reflectance
@@ -190,6 +190,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         self.cam = str(cam)
         self.camera_folder = f'image_{cam}'
         self.change_frame = change_frame
+        self.quantitative_eval_error = quantitative_eval_error
         if dataset == 'kitti':
             self.maps_folder = 'velodyne'
             self.extension = '.bin'
@@ -352,25 +353,30 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             pc_in = rotate_forward(pc_in, R, T)
 
         max_angle = self.max_r
-        # rotz = np.random.uniform(max_angle, max_angle) * (3.141592 / 180.0)
-        # roty = np.random.uniform(max_angle, max_angle) * (3.141592 / 180.0)
-        # rotx = np.random.uniform(max_angle, max_angle) * (3.141592 / 180.0)
-        # transl_x = np.random.uniform(self.max_t, self.max_t)
-        # transl_y = np.random.uniform(self.max_t, self.max_t)
-        # transl_z = np.random.uniform(self.max_t, min(self.max_t, 1.))
-        rotz = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
-        roty = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
-        rotx = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
-        transl_x = np.random.uniform(-self.max_t, self.max_t)
-        transl_y = np.random.uniform(-self.max_t, self.max_t)
-        transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
+        if not self.quantitative_eval_error:
+            rotz = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
+            roty = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
+            rotx = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
+            transl_x = np.random.uniform(-self.max_t, self.max_t)
+            transl_y = np.random.uniform(-self.max_t, self.max_t)
+            transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
 
-        if self.change_frame:
-            R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
-            T = mathutils.Vector((transl_x, transl_y, transl_z))
+            if self.change_frame:
+                R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
+                T = mathutils.Vector((transl_x, transl_y, transl_z))
+            else:
+                R = mathutils.Euler((roty, rotz, rotx), 'XYZ')
+                T = mathutils.Vector((transl_y, transl_z, transl_x))
         else:
-            R = mathutils.Euler((roty, rotz, rotx), 'XYZ')
-            T = mathutils.Vector((transl_y, transl_z, transl_x))
+            max_angle_rad = max_angle * (np.pi / 180.)
+            axis = np.random.randn(3)
+            axis /= np.linalg.norm(axis)
+            rotation_quat = mathutils.Quaternion(axis.tolist(), max_angle_rad)
+            direction = np.random.randn(3)
+            direction /= np.linalg.norm(direction)
+            translation_vec = direction * self.max_t
+            R = rotation_quat
+            T = mathutils.Vector(translation_vec.tolist())
 
 
         R, T = invert_pose(R, T)

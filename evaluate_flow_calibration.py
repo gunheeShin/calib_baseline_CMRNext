@@ -465,7 +465,8 @@ def evaluate_calibration(_config, seed):
         dataset_val = DatasetGeneralExtrinsicCalib(val_directories, train=False, max_r=_config['max_r'],
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
                                                    normalize_images=_config['normalize_images'],
-                                                   dataset=_config['dataset'], cam=_config['cam'], sensor_type=_config['sensor_type'], downsample=_config['downsize'])
+                                                   dataset=_config['dataset'], cam=_config['cam'], sensor_type=_config['sensor_type'], downsample=_config['downsize'],
+                                                   quantitative_eval_error=_config['quantitative_eval_error'])
 
     def init_fn(x):
         return _init_fn(x, seed)
@@ -1054,6 +1055,8 @@ def main():
     parser.add_argument('--max_t', type=float, default=1.5)
     parser.add_argument('--max_r', type=float, default=20.)
     parser.add_argument('--fix_rt', type=str2bool, nargs='?', const=True, default=False) # fix initial RT error by using the first frame
+    parser.add_argument('--quantitative_eval_error', type=str2bool, nargs='?', const=True, default=False,
+                        help='Use quantitative error calculation for evaluation')
     parser.add_argument('--num_worker', type=int, default=2)
     parser.add_argument('--weights', type=str, nargs='+', default=None)
     parser.add_argument('--img_shape', type=int, nargs=1, default=2)
