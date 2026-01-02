@@ -8,6 +8,7 @@ import time
 
 import mathutils
 import numpy as np
+import cv2
 import torch
 import torch.nn.functional as F
 import torch.nn.parallel
@@ -67,13 +68,16 @@ def uncertainty_to_color(_tensor, mask=None):
     return color
 
 
-def prepare_input(_config, device, idx, img_shape, mean, sample, std):
+def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=False):
+    # 샘플 기본 정보와 포인트클라우드 준비
     real_shape = [sample['rgb'][idx].shape[0], sample['rgb'][idx].shape[1], sample['rgb'][idx].shape[2]]
     sample['point_cloud'][idx] = sample['point_cloud'][idx].to(device)
     pc_rotated = sample['point_cloud'][idx].clone()
     reflectance = None
     if _config['use_reflectance']:
         reflectance = sample['reflectance'][idx].to(device)
+
+    # RT(오차 extrinsic) 구성: rot_error/tr_error → 4×4 변환행렬
     R = mathutils.Quaternion(sample['rot_error'][idx]).to_matrix()
     R.resize_4x4()
     T = mathutils.Matrix.Translation(sample['tr_error'][idx])
@@ -81,13 +85,58 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std):
         RT = T @ R
     except:
         RT = T * R
-    pc_rotated = rotate_back(pc_rotated, RT)
+
+    if not aligned:
+        pc_rotated = rotate_back(pc_rotated, RT)
+
+    rgb = sample['rgb'][idx].to(device)
+    if _config['normalize_images']:
+        rgb = rgb / 255.
+        rgb = (rgb - mean) / std
+    rgb = rgb.permute(2, 0, 1)
+
     cam_params = sample['calib'][idx].to(device)
+
     cam_model = CameraModel()
     cam_model.focal_length = cam_params[:2]
     cam_model.principal_point = cam_params[2:]
+
+    # Scale(Upsample or downsample) for Hercules dataset according to focal length
+    if _config['dataset'] == 'hercules' and _config['downsize'] == True:
+        target_fx, target_fy = 718.5377, 718.5377
+        scale_x = float(target_fx) / float(cam_params[0])
+        scale_y = float(target_fy) / float(cam_params[1])
+        scale = (scale_x + scale_y) * 0.5
+        cam_model.focal_length = cam_params[:2] * scale
+        cam_model.principal_point = cam_params[2:] * scale
+        if scale != 1.0:
+            resize_shape = (int(round(real_shape[1] * scale)), int(round(real_shape[0] * scale)))  # (width, height)
+
+            # image resize
+            rgb = rgb.unsqueeze(0)
+            rgb = F.interpolate(rgb, size=(resize_shape[1], resize_shape[0]), mode='bilinear', align_corners=True)[0]
+
+            # crop to original image size
+            if resize_shape[0] >= real_shape[1]:
+                crop_w_start = (resize_shape[0] - real_shape[1]) // 2
+                rgb = rgb[:, :, crop_w_start:crop_w_start + real_shape[1]]
+                real_shape[1] = real_shape[1]
+                cam_model.principal_point[0] -= crop_w_start
+            else:
+                real_shape[1] = resize_shape[0]
+
+            if resize_shape[1] >= real_shape[0]:
+                crop_h_start = (resize_shape[1] - real_shape[0]) // 2
+                rgb = rgb[:, crop_h_start:crop_h_start + real_shape[0], :]
+                real_shape[0] = real_shape[0]
+                cam_model.principal_point[1] -= crop_h_start
+            else:
+                real_shape[0] = resize_shape[1]
+                
+
     uv_lidar, depth, _, refl = cam_model.project_pytorch(pc_rotated, real_shape, reflectance)
     uv_lidar = uv_lidar.t().int().contiguous()
+
     depth_img = torch.zeros(real_shape[:2], device=device, dtype=torch.float)
     depth_img += 1000.
     depth_img = visibility.depth_image(uv_lidar, depth, depth_img, uv_lidar.shape[0], real_shape[1],
@@ -95,15 +144,22 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std):
     temp_index = (depth_img == 1000.)
     depth_img[temp_index] = 0.
     depth_img_no_occlusion = depth_img
+
+    # “진짜로 남은 점”만 필터링 (z-buffer 일치 검사)
     uv_lidar = uv_lidar.long()
     indexes = depth_img_no_occlusion[uv_lidar[:, 1], uv_lidar[:, 0]] == depth
     if _config['use_reflectance']:
         refl_img = torch.zeros(real_shape[:2], device=device, dtype=torch.float)
         refl_img[uv_lidar[indexes, 1], uv_lidar[indexes, 0]] = refl[0, indexes]
+    
+    # depth 정규화 및 채널 구성
     depth_img_no_occlusion /= _config['max_depth']
     depth_img_no_occlusion = depth_img_no_occlusion.unsqueeze(0)
     if _config['use_reflectance']:
         depth_img_no_occlusion = torch.cat((depth_img_no_occlusion, refl_img.unsqueeze(0)))
+
+
+    # GT flow 만들기: RT가 유발한 픽셀 이동량 계산
     uv_lidar = uv_lidar[indexes]
     flow, _, new_indexes = get_flow_zforward(uv_lidar.float(), depth[indexes], RT, cam_model,
                                              [real_shape[0], real_shape[1], 3],
@@ -112,15 +168,14 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std):
     uv_flow = uv_lidar
     uv_flow = uv_flow[new_indexes].clone()
     flow = flow[new_indexes].clone()
-    rgb = sample['rgb'][idx].to(device)
-    if _config['normalize_images']:
-        rgb = rgb / 255.
-        rgb = (rgb - mean) / std
-    rgb = rgb.permute(2, 0, 1)
+
+    # dense flow 이미지와 마스크로 “뿌리기”
     flow_img = torch.zeros((real_shape[0], real_shape[1], 2), device=device, dtype=torch.float)
     flow_img[uv_flow[:, 1], uv_flow[:, 0]] = flow
     flow_mask = torch.zeros((real_shape[0], real_shape[1]), device=device, dtype=torch.int)
     flow_mask[uv_flow[:, 1], uv_flow[:, 0]] = 1
+
+    # Argoverse(1920 width)면 half-scale 처리
     # Scale by half if the image is from the ARGO dataset
     if real_shape[1] == 1920 and _config['subset_argoverse']:
         flow_img, flow_mask = downsample_flow_and_mask(flow_img, flow_mask, 2, scale_flow=True)
@@ -129,22 +184,43 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std):
         depth_img_no_occlusion = depth_img_no_occlusion.permute(2, 0, 1)
         real_shape[0] = real_shape[0] // 2
         real_shape[1] = real_shape[1] // 2
-    if img_shape is not None and img_shape[0] <= real_shape[0]:
-        h, w = real_shape[:2]
+
+    # crop (mode 0: random, mode 1: valid-area random)
+    if img_shape is not None:
         th, tw = img_shape
-        crop_top = random.randint(0, h - th)
-        rgb = rgb[:, crop_top:crop_top + th, :]
-        depth_img_no_occlusion = depth_img_no_occlusion[:, crop_top:crop_top + th, :]
-        flow_img = flow_img[crop_top:crop_top + th, :, :]
-        flow_mask = flow_mask[crop_top:crop_top + th, :]
-    if img_shape is not None and img_shape[1] <= real_shape[1]:
         h, w = real_shape[:2]
-        th, tw = img_shape
-        crop_left = random.randint(0, w - tw)
-        rgb = rgb[:, :, crop_left:crop_left + tw]
-        depth_img_no_occlusion = depth_img_no_occlusion[:, :, crop_left:crop_left + tw]
-        flow_img = flow_img[:, crop_left:crop_left + tw, :]
-        flow_mask = flow_mask[:, crop_left:crop_left + tw]
+        crop_mode = _config.get('crop_mode', 0)
+
+        # crop이 가능한 경우에만 수행하고, 작은 경우는 pad에서 처리
+        if (h >= th) and (w >= tw):
+            if crop_mode == 1:
+                valid_mask = (flow_mask > 0)
+                valid_ys, valid_xs = torch.where(valid_mask)
+                if valid_ys.numel() > 0:
+                    rand_idx = torch.randint(0, valid_ys.numel(), (1,))
+                    cy = valid_ys[rand_idx].item()
+                    cx = valid_xs[rand_idx].item()
+                    top = cy - th // 2
+                    left = cx - tw // 2
+                else:
+                    top = random.randint(0, h - th)
+                    left = random.randint(0, w - tw)
+            else:
+                top = random.randint(0, h - th)
+                left = random.randint(0, w - tw)
+
+            top = max(0, min(top, h - th))
+            left = max(0, min(left, w - tw))
+
+            rgb = rgb[:, top:top + th, left:left + tw]
+            depth_img_no_occlusion = depth_img_no_occlusion[:, top:top + th, left:left + tw]
+            flow_img = flow_img[top:top + th, left:left + tw, :]
+            flow_mask = flow_mask[top:top + th, left:left + tw]
+            real_shape[0] = th
+            real_shape[1] = tw
+
+
+    # pad (오른쪽/아래만)로 목표 크기 맞춤
     if img_shape is not None and (img_shape[0] >= real_shape[0] or img_shape[1] >= real_shape[1]):
         # PAD ONLY ON RIGHT AND BOTTOM SIDE, IN ORDER TO BE CONSISTENT WITH FLOW
         shape_pad = [0, 0, 0, 0]
@@ -156,6 +232,8 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std):
         depth_img_no_occlusion = F.pad(depth_img_no_occlusion, shape_pad)
         flow_img = F.pad(flow_img.permute(2, 0, 1), shape_pad).permute(1, 2, 0)
         flow_mask = F.pad(flow_mask, shape_pad)
+
+    # Fourier feature로 depth를 채널 확장 (옵션)
     if _config['fourier_levels'] >= 0:
         depth_img_no_occlusion = depth_img_no_occlusion.squeeze()
         mask = (depth_img_no_occlusion > 0).clone()
@@ -372,8 +450,20 @@ def main(gpu, _config, common_seed, world_size):
     mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
     std = torch.tensor([0.229, 0.224, 0.225]).to(device)
 
+    debug_save_dir = _config['save_dir'] + "/"
+    debug_save_dir += _config['dataset'] + "/train/"
+    if not os.path.exists(debug_save_dir):
+        os.makedirs(debug_save_dir)
+    else:
+        import shutil
+        shutil.rmtree(debug_save_dir)
+        os.makedirs(debug_save_dir)
+    debug_input_data_dir = debug_save_dir + "input_data/"
+    os.makedirs(debug_input_data_dir)
+
     # total_iter = starting_epoch * len(dataset)
     total_iter = 0
+    dataset_custom = None
     for epoch in range(starting_epoch, _config['epochs']):
 
         if _config['custom']:
@@ -388,6 +478,19 @@ def main(gpu, _config, common_seed, world_size):
                                                          dataset='custom', sensor_type=_config['sensor_type'], downsample=_config['downsize'])
 
             dataset_train = dataset_custom
+
+        elif _config['dataset'] == 'hercules':
+            train_directories_hercules = []
+            # for subdir in ['library_1', 'library_3', 'parking_lot_1', 'parking_lot_4', 'SC_1', 'SC_3', 'island_1', 'island_2']:
+            for subdir in ['parking_lot_1']:
+                train_directories_hercules.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'offline'))
+
+            dataset_hercules = DatasetGeneralExtrinsicCalib(train_directories_hercules, train=True, max_r=_config['max_r'],
+                                                         max_t=_config['max_t'],
+                                                         use_reflectance=_config['use_reflectance'],
+                                                         normalize_images=_config['normalize_images'],
+                                                         dataset='hercules', sensor_type=_config['sensor_type'], downsample=_config['downsize'])
+            dataset_train = dataset_hercules
 
         else:
             train_directories_kitti = []
@@ -451,24 +554,8 @@ def main(gpu, _config, common_seed, world_size):
                     logger.warning(f"Dataset size is different than what is should be:\n"
                                    f"Expected size: 36000, Current size: {len(dataset_train)}")
 
-        if epoch == starting_epoch:
-            if starting_epoch == 0:
-                scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
-                                                                epochs=_config['epochs'],
-                                                                steps_per_epoch=len(dataset_train) // (
-                                                                        batch_size * world_size),
-                                                                pct_start=0.4, div_factor=10,
-                                                                final_div_factor=100000)
-            else:
-                scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
-                                                                epochs=_config['epochs'] + 1,
-                                                                steps_per_epoch=len(dataset_train) // (
-                                                                        batch_size * world_size),
-                                                                pct_start=0.4, div_factor=10,
-                                                                final_div_factor=100000, last_epoch=starting_epoch * (
-                            len(dataset_train) // (batch_size * world_size)))
-            total_iter = starting_epoch * len(dataset_train)
 
+        # Validation set creation
         if _config['custom']:
             test_directories_custom = []
             for subdir in ['parking_lot_2']:
@@ -481,6 +568,24 @@ def main(gpu, _config, common_seed, world_size):
                                                           dataset='custom',sensor_type=_config['sensor_type'], downsample=_config['downsize'])
 
             dataset_val = dataset_val_custom
+
+            print ("Len Custom Val Dataset: ", len(dataset_val))
+        
+        elif _config['dataset'] == 'hercules':
+            test_directories_hercules = []
+            # for subdir in ['parking_lot_2']:
+            for subdir in ['parking_lot_1']:
+                test_directories_hercules.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'offline'))
+
+            dataset_val_hercules = DatasetGeneralExtrinsicCalib(test_directories_hercules, train=True, max_r=_config['max_r'],
+                                                          max_t=_config['max_t'],
+                                                          use_reflectance=_config['use_reflectance'],
+                                                          normalize_images=_config['normalize_images'],
+                                                          dataset='hercules',sensor_type=_config['sensor_type'], downsample=_config['downsize'])
+
+            dataset_val = dataset_val_hercules
+
+            print ("Len Hercules Val Dataset: ", len(dataset_val))
 
         else:
             test_directories_kitti = []
@@ -507,7 +612,8 @@ def main(gpu, _config, common_seed, world_size):
             dataset_train,
             num_replicas=world_size,
             rank=rank,
-            seed=common_seed
+            seed=common_seed,
+            shuffle=True
         )
         val_sampler = torch.utils.data.distributed.DistributedSampler(
             dataset_val,
@@ -543,6 +649,25 @@ def main(gpu, _config, common_seed, world_size):
             logger.info(f'Len Train: {len(TrainImgLoader)}')
             logger.info(f'Len Test: {len(TestImgLoader)}')
             logger.info(f'This is {epoch}-th epoch')
+
+
+        if epoch == starting_epoch:
+            if starting_epoch == 0:
+                scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
+                                                                epochs=_config['epochs'],
+                                                                steps_per_epoch=len(dataset_train) // (
+                                                                        batch_size * world_size),
+                                                                pct_start=0.4, div_factor=10,
+                                                                final_div_factor=100000)
+            else:
+                scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
+                                                                epochs=_config['epochs'] + 1,
+                                                                steps_per_epoch=len(dataset_train) // (
+                                                                        batch_size * world_size),
+                                                                pct_start=0.4, div_factor=10,
+                                                                final_div_factor=100000, last_epoch=starting_epoch * (
+                            len(dataset_train) // (batch_size * world_size)))
+            total_iter = starting_epoch * len(dataset_train)
 
         EPOCH = epoch
         epoch_start_time = time.time()
@@ -582,8 +707,10 @@ def main(gpu, _config, common_seed, world_size):
                 # ProjectPointCloud in RT-pose
 
                 depth_img_no_occlusion, flow_img, flow_mask, rgb = prepare_input(_config, device,
-                                                                                 idx, img_shape, mean, sample, std)
-
+                                                                                 idx, img_shape, mean, sample, std, aligned=False)
+                if _config['debug']:
+                    aligned_img_no_occlusion, _, _, aligned_rgb = prepare_input(_config, device,
+                                                                    idx, img_shape, mean, sample, std, aligned=True)
                 flow_img = flow_img.contiguous()
                 flow_mask = flow_mask.contiguous()
                 rgb_input.append(rgb)
@@ -609,16 +736,71 @@ def main(gpu, _config, common_seed, world_size):
                 target_mask6.append(down_mask6.repeat(2, 1, 1).float().clone())
 
                 if _config['debug']:
-                    io.imshow(rgb.permute(1, 2, 0).cpu().numpy())
-                    io.show()
-                    io.imshow(flow_mask.cpu().numpy())
-                    io.show()
-                    io.imshow(flow_img[:, :, 1].cpu().numpy())
-                    io.show()
-                    io.imshow(flow_to_color(flow_img.cpu().numpy()))
-                    io.show()
-                    io.imshow(depth_img_no_occlusion[0].cpu().numpy())
-                    io.show()
+                    def _depth_overlay(depth_tensor, base_rgb):
+                        depth_np = depth_tensor[0].detach().cpu().numpy()
+                        depth_mask = depth_np > 0
+                        if depth_mask.any():
+                            depth_vals = depth_np[depth_mask]
+                            lo = np.percentile(depth_vals, 1)
+                            hi = np.percentile(depth_vals, 99)
+                            if hi <= lo:
+                                lo, hi = depth_vals.min(), depth_vals.max()
+                            depth_norm = (depth_np - lo) / (hi - lo + 1e-8)
+                            depth_norm = np.clip(depth_norm, 0, 1)
+                            depth_colors = (cm.jet(depth_norm)[:, :, :3] * 255.0).astype(np.uint8)
+                            overlay = base_rgb.copy()
+                            overlay[depth_mask] = depth_colors[depth_mask]
+                            return overlay
+                        return base_rgb
+                    
+                    def _flow_arrows(flow_tensor, mask_tensor, base_rgb, step=20):
+                        arrows = base_rgb.copy()
+                        flow_np = flow_tensor.detach().cpu().numpy()
+                        mask_np = mask_tensor.detach().cpu().numpy()
+                        h, w = flow_np.shape[:2]
+                        for y in range(0, h, step):
+                            for x in range(0, w, step):
+                                if mask_np[y, x] == 0:
+                                    continue
+                                dx, dy = flow_np[y, x]
+                                if dx == 0 and dy == 0:
+                                    continue
+                                pt1 = (int(x), int(y))
+                                pt2 = (int(x + dx), int(y + dy))
+                                cv2.arrowedLine(arrows, pt1, pt2, color=(0, 255, 0), thickness=1, tipLength=0.3)
+                        return arrows
+
+                    # print("RGB")
+                    # io.imshow(rgb.permute(1, 2, 0).cpu().numpy())
+                    # print("Flow Mask")
+                    # io.imshow(flow_mask.cpu().numpy())
+                    # io.show()
+                    # print("Flow image")
+                    # io.imshow(flow_to_color(flow_img.cpu().numpy()))
+                    # io.show()
+                    # print("Depth image")
+                    # io.imshow(depth_img_no_occlusion[0].cpu().numpy())
+                    # io.show()
+
+                    # save images for debug
+                    base_name = f"rank{rank}_e{epoch}_b{batch_idx}_i{idx}"
+
+                    rgb_np = rgb.permute(1, 2, 0).detach().cpu().numpy()
+                    aligned_rgb_np = aligned_rgb.permute(1, 2, 0).detach().cpu().numpy()
+                    if _config['normalize_images']:
+                        raw_rgb = (rgb_np * std.cpu().numpy()) + mean.cpu().numpy()
+                        raw_rgb = np.clip(raw_rgb * 255.0, 0, 255).astype(np.uint8)
+                        aligned_raw_rgb = (aligned_rgb_np * std.cpu().numpy()) + mean.cpu().numpy()
+                        aligned_raw_rgb = np.clip(aligned_raw_rgb * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        raw_rgb = np.clip(rgb_np, 0, 255).astype(np.uint8)
+                        aligned_raw_rgb = np.clip(aligned_rgb_np, 0, 255).astype(np.uint8)
+                    pc_overlay = _depth_overlay(depth_img_no_occlusion, raw_rgb)
+                    aligned_overlay = _depth_overlay(aligned_img_no_occlusion, aligned_raw_rgb)
+                    flow_arrows = _flow_arrows(flow_img, flow_mask, raw_rgb)
+                    concat_img = np.concatenate([aligned_overlay, pc_overlay, flow_arrows], axis=1)
+                    io.imsave(os.path.join(debug_input_data_dir, f"{base_name}_debug_concat.png"), concat_img)
+
 
             lidar_input = torch.stack(lidar_input)
             rgb_input = torch.stack(rgb_input)
@@ -867,7 +1049,7 @@ def main(gpu, _config, common_seed, world_size):
             old_save_filename = savefilename
 
         # Cleanup
-        del sample, dataset_custom, dataset_train, dataset_val, TrainImgLoader
+        del sample, dataset_train, dataset_val, TrainImgLoader
 
     if rank == 0:
         logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
@@ -930,6 +1112,9 @@ def real_main():
     parser.add_argument('--context_encoder', type=str, default="lidar", choices=["lidar"])
     parser.add_argument('--sensor_type', type=str, default="lidar")
     parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--crop_mode', type=int, default=0)
+    parser.add_argument('--dataset', type=str, default="kitti")
+    parser.add_argument('--save_dir', type=str, default='./logs/')
 
     args = parser.parse_args()
     # print(args)

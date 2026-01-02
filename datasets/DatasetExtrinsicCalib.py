@@ -33,6 +33,19 @@ class ReadOpen3d:
         return points
 
 
+class ReadBinWithTime:
+    def __call__(self, file):
+        dtype = np.dtype([
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("intensity", "<f4"),
+            ("time_ns", "<u4"),
+        ])
+        data = np.fromfile(file, dtype=dtype)
+        return np.stack([data["x"], data["y"], data["z"], data["intensity"]], axis=1)
+
+
 def is_image(img):
     extensions = ['.jpg', '.png', '.tiff', '.jpeg', '.bmp']
     return os.path.splitext(img)[1] in extensions
@@ -173,8 +186,7 @@ def get_extrinsic_pandaset(camera):
 class DatasetGeneralExtrinsicCalib(Dataset):
 
     def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=2., max_r=10.,
-                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False, sensor_type='lidar', downsample=False,
-                 camera_intrinsics=None):
+                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False, sensor_type='lidar', downsample=False):
         super(DatasetGeneralExtrinsicCalib, self).__init__()
         self.dataset = dataset
         self.use_reflectance = use_reflectance
@@ -203,7 +215,13 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 self.camera_folder = 'Downsample/camera'
             else:
                 self.camera_folder = 'camera'
+        elif dataset == 'hercules':
+            self.maps_folder = sensor_type
+            self.camera_folder = 'image_left'
+            self.downsample = downsample
+
         self.all_files = []
+        self.synced_stamps = []
 
         if not isinstance(dataset_dirs, list):
             dataset_dirs = [dataset_dirs]
@@ -248,9 +266,43 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                         continue
                     self.all_files.append(os.path.join(img_folder, filename))
 
+            if dataset == 'hercules':
+                with open(os.path.join(directory, 'calibration.yaml')) as f:
+                    file_data = yaml.safe_load(f)
+
+                self.camera_intrinsics = torch.tensor(
+                    [file_data['fx'], file_data['fy'], file_data['cx'], file_data['cy']])
+                self.initial_extrinsic = torch.tensor(file_data['initial_extrinsic'], dtype=torch.float).reshape(4, 4)
+                first_scan = os.listdir(os.path.join(directory,'sensor_data', self.maps_folder))
+                first_scan = sorted(first_scan)[0]
+                self.extension = os.path.splitext(first_scan)[1]
+
+                self.point_cloud_reader = ReadBinWithTime()
+                
+                img_folder = os.path.join(directory, self.camera_folder)
+                point_cloud_folder = os.path.join(directory, self.maps_folder)
+
+                synced_stamp_path = os.path.join(directory, 'synced_stamps', 'image_left_' + self.maps_folder + '.txt')
+                with open(synced_stamp_path, 'r') as f:
+                    for line in f.read().splitlines():
+                        
+                        # skip first line
+                        if 'image' in line:
+                            continue
+
+                        parts = line.split()
+                        if len(parts) < 2:
+                            continue
+                        image_stamp, maps_stamp = parts[0], parts[1]
+                        self.synced_stamps.append((directory, image_stamp, maps_stamp))
+
+                        if len(self.synced_stamps) >100:
+                            break
+                    print(f"Loaded {len(self.synced_stamps)} synced stamps from {synced_stamp_path}")
+
     def custom_transform(self, rgb, calib, img_rotation=0., flip=False):
         if self.train:
-            color_transform = transforms.ColorJitter(0.2, 0.2, 0.2)
+            color_transform = transforms.ColorJitter(0.2, 0.2, 0.2) # 밝기, 대비, 채도 변화 20% 수준
             rgb = color_transform(rgb)
         rgb = np.array(rgb)
         if self.train:
@@ -263,6 +315,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         return torch.tensor(rgb).float()
 
     def __len__(self):
+        if self.dataset == 'hercules':
+            return len(self.synced_stamps)
         return len(self.all_files)
 
     def __getitem__(self, idx):
@@ -272,6 +326,13 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             extension = os.path.splitext(extension)[1]
             pc_path = img_path.replace(f'/{self.camera_folder}/', f'/{self.maps_folder}/').replace(extension,
                                                                                                    self.extension)
+            
+        elif self.dataset == 'hercules':
+            # read stamps from self.synced_stamps
+            directory, image_stamp, maps_stamp = self.synced_stamps[idx]
+            img_path = os.path.join(directory, 'sensor_data', self.camera_folder, f'{image_stamp}.png')
+            pc_path = os.path.join(directory, 'sensor_data', self.maps_folder,
+                                   f'{maps_stamp}{self.extension}')
         elif self.dataset == 'argoverse':
             pc_path = self.all_files[idx]
 
@@ -286,14 +347,13 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             cam_timestamp = sdb.get_closest_cam_channel_timestamp(lidar_stamp, self.cam, log_id)
 
             img_path = pc_path.replace('/' + self.maps_folder + '/', f'/{self.cam}/')
-            img_path = img_path.replace(splitted_path[-1], f'{self.cam}_{cam_timestamp}.jpg')
+            img_path = img_path.replace(splitted_path[-1], f'{self.cam}_{cam_timestamp}.png')
 
             pc, cam2vel, calib = get_scan_argo(pc_path, self.cam)
         elif self.dataset == 'custom':
             pc = self.point_cloud_reader(pc_path)
             cam2vel = self.initial_extrinsic
-            calib = self.camera_intrinsics
-
+            calib = self.camera_intrinsics.clone()
             if self.maps_folder == 'radar':
                 if pc.shape[0] == 0 or pc.shape[1] < 3:
                     print(f"[WARNING] Empty or invalid point cloud at {pc_path}, resampling")
@@ -314,6 +374,28 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 print("[ERROR], Point cloud has less than 3 channels")
                 sys.exit(1)
 
+        elif self.dataset == 'hercules':
+            pc = self.point_cloud_reader(pc_path)
+            cam2vel = self.initial_extrinsic
+            calib = self.camera_intrinsics.clone()
+
+            if pc.shape[1] == 3:
+                pc = np.concatenate((pc, np.ones((pc.shape[0], 1))), 1)
+            elif pc.shape[1] >= 4:
+                pc = pc[:, :4]
+            else:
+                print("[ERROR], Point cloud has less than 3 channels")
+                sys.exit(1)
+
+            if not os.path.exists(img_path):
+                print(f"[WARNING] Missing image for stamp {img_path}, resampling")
+                new_idx = np.random.randint(0, self.__len__())
+                return self.__getitem__(new_idx)
+            if not os.path.exists(pc_path):
+                print(f"[WARNING] Missing point cloud for stamp {pc_path}, resampling")
+                new_idx = np.random.randint(0, self.__len__())
+                return self.__getitem__(new_idx)
+
         if self.use_reflectance:
             reflectance = torch.from_numpy(pc[:, -1]).float()
         pc[:, -1] = 1
@@ -324,20 +406,20 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             pc_in = pc_in[[2, 0, 1, 3], :]
 
         img = Image.open(img_path)
-        h_mirror = False
-        if np.random.rand() > 0.5 and self.train:
-            h_mirror = True
-            if self.change_frame:
-                pc_in[1, :] *= -1
-            else:
-                pc_in[0, :] *= -1
-            calib[2] = img.size[0] - calib[2]
+        h_mirror = False # 좌우 반전
+        # if np.random.rand() > 0.5 and self.train:
+        #     h_mirror = True
+        #     if self.change_frame:
+        #         pc_in[1, :] *= -1
+        #     else:
+        #         pc_in[0, :] *= -1
+        #     calib[2] = img.size[0] - calib[2] # cx 변경
 
         img_rotation = 0.
         if self.train:
             img_rotation = np.random.uniform(-5, 5)
         try:
-            img = self.custom_transform(img, calib, img_rotation, h_mirror)
+            img = self.custom_transform(img, calib, img_rotation, h_mirror) # 이미지 flip 및 회전
         except OSError:
             new_idx = np.random.randint(0, self.__len__())
             return self.__getitem__(new_idx)

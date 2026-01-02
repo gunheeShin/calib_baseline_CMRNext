@@ -1,1 +1,3 @@
-python3 train_calibration.py --savemodel /ws/data/LG_Innotek/Checkpoint/hercules --data_folder_custom /ws/data/LG_Innotek/PublicDataset/hercules --custom --max_r 5 --max_t 0.5 --batch_size 4 --sensor_type radar --downsize
+clear
+
+python3 train_calibration.py --savemodel /ws/data/checkpoints --data_folder_custom /ws/data/hercules --save_dir /ws/data/cmrnext_results --dataset hercules --max_r 20 --max_t 0.5 --batch_size 1 --eval_batch_size 1 --sensor_type lidar_Aeva --downsize --epochs 1 --debug --crop_mode 1
