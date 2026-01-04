@@ -1,0 +1,13 @@
+python3 evaluate_flow_calibration.py \
+	    --weights /ws/data/LG_Innotek/PublicDataset/checkpoints/checkpoint_22_19.290.tar \
+	    --data_folder /ws/data/LG_Innotek/PublicDataset \
+	    --num_worker 1 \
+	    --quantile 1.0 \
+	    --max_t 0.5 \
+	    --max_r 5 \
+		--dataset hercules \
+	    --test_topic default \
+		--data_type lg_custom \
+	    --image_name image_left \
+	    --pcl_name radar_Continental \
+		--fix_error False \

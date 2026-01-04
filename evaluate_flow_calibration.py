@@ -20,6 +20,7 @@ import visibility
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+import yaml
 
 from datasets.DatasetExtrinsicCalib import DatasetGeneralExtrinsicCalib, DatasetPandasetExtrinsicCalib
 from camera_model import CameraModel
@@ -257,6 +258,26 @@ def evaluate_calibration(_config, seed):
             img_shape[0] = 64 * ((img_shape[0] // 64) + 1)
         if img_shape[1] % 64 > 0:
             img_shape[1] = 64 * ((img_shape[1] // 64) + 1)
+    elif _config['data_type'] == 'lg_custom':
+        
+        if _config['dataset'] == 'hercules':
+            subdir_list = ['parking_lot_1']
+        elif _config['dataset'] == 'lg_innotek':
+            subdir_list = ['001']
+        
+        for subdir in subdir_list:
+            val_directories.append(os.path.join(_config['data_folder'], _config['dataset'], subdir, 'offline'))
+
+        first_camera_path = os.listdir(os.path.join(val_directories[0],'sensor_data', _config['image_name']))[0]
+        first_camera_frame = np.asarray(Image.open(os.path.join(val_directories[0],'sensor_data', _config['image_name'], first_camera_path)))
+        img_shape = [first_camera_frame.shape[0], first_camera_frame.shape[1]]
+
+        if _config['downsample']:
+            img_shape = [img_shape[0] // 2, img_shape[1] // 2]
+        if img_shape[0] % 64 > 0:
+            img_shape[0] = 64 * ((img_shape[0] // 64) + 1)
+        if img_shape[1] % 64 > 0:
+            img_shape[1] = 64 * ((img_shape[1] // 64) + 1)
     else:
         raise RuntimeError("Dataset unknown")
 
@@ -285,6 +306,11 @@ def evaluate_calibration(_config, seed):
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
                                                    normalize_images=_config['normalize_images'],
                                                    dataset=_config['dataset'], cam=_config['cam'], sensor_type=_config['sensor_type'], downsample=_config['downsize'])
+    elif _config['data_type'] == 'lg_custom':
+        dataset_val = DatasetGeneralExtrinsicCalib(val_directories, train=False, max_r=_config['max_r'],
+                                                   max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
+                                                   normalize_images=_config['normalize_images'],
+                                                   dataset=_config['dataset'], cam=_config['cam'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], data_type=_config['data_type'], fix_error=_config['fix_error'])
 
     def init_fn(x):
         return _init_fn(x, seed)
@@ -354,6 +380,7 @@ def evaluate_calibration(_config, seed):
             real_shape = [sample['rgb'][idx].shape[0], sample['rgb'][idx].shape[1], sample['rgb'][idx].shape[2]]
 
             sample['point_cloud'][idx] = sample['point_cloud'][idx].cuda()
+            # Filter points beyond max depth
             if _config['max_depth'] < 100.:
                 sample['point_cloud'][idx] = sample['point_cloud'][idx][:,
                                              sample['point_cloud'][idx][0, :] < _config['max_depth']]
@@ -371,22 +398,6 @@ def evaluate_calibration(_config, seed):
 
             pc_rotated = rotate_forward(pc_rotated, extrinsic_error[0])
 
-            # Project point cloud into virtual image plane placed at random 'initial_calib'
-            cam_params = sample['calib'][idx].cuda()
-            depth_img_no_occlusion, uv, indexes, depth = prepare_input(cam_params, pc_rotated, real_shape,
-                                                                       reflectance, _config)
-            cam_model = CameraModel()
-            cam_model.focal_length = cam_params[:2]
-            cam_model.principal_point = cam_params[2:]
-
-            flow, points_3D, new_indexes = get_flow_zforward(uv.float(), depth[indexes], RT1_inv, cam_model,
-                                                             [real_shape[0], real_shape[1], 3],
-                                                             scale_flow=False, reverse=False,
-                                                             get_valid_indexes=True)
-
-            uv = uv[new_indexes].clone()
-            flow = flow[new_indexes].clone()
-
             rgb = sample['rgb'][idx].cuda()
 
             # Normalize image
@@ -394,7 +405,70 @@ def evaluate_calibration(_config, seed):
             if _config['normalize_images']:
                 rgb = (rgb - mean_torch) / std_torch
             rgb = rgb.permute(2, 0, 1)
+
+            cam_params = sample['calib'][idx].cuda()
+
+            # Scale(Upsample or downsample) for Hercules dataset according to focal length
+            if _config['dataset'] == 'hercules' and _config['downsize'] == True:
+                target_fx, target_fy = 718.5377, 718.5377
+                scale_x = float(target_fx) / float(cam_params[0])
+                scale_y = float(target_fy) / float(cam_params[1])
+                scale = (scale_x + scale_y) * 0.5
+                cam_params[0] = cam_params[0] * scale
+                cam_params[1] = cam_params[1] * scale
+                cam_params[2] = cam_params[2] * scale
+                cam_params[3] = cam_params[3] * scale
+                if scale != 1.0:
+                    resize_shape = (int(round(real_shape[1] * scale)), int(round(real_shape[0] * scale)))  # (width, height)
+
+                    # image resize
+                    rgb = rgb.unsqueeze(0)
+                    rgb = F.interpolate(rgb, size=(resize_shape[1], resize_shape[0]), mode='bilinear', align_corners=True)[0]
+
+                    # crop to original image size
+                    if resize_shape[0] >= real_shape[1]:
+                        crop_w_start = (resize_shape[0] - real_shape[1]) // 2
+                        rgb = rgb[:, :, crop_w_start:crop_w_start + real_shape[1]]
+                        real_shape[1] = real_shape[1]
+                        cam_params[2] -= crop_w_start
+                    else:
+                        real_shape[1] = resize_shape[0]
+
+                    if resize_shape[1] >= real_shape[0]:
+                        crop_h_start = (resize_shape[1] - real_shape[0]) // 2
+                        rgb = rgb[:, crop_h_start:crop_h_start + real_shape[0], :]
+                        real_shape[0] = real_shape[0]
+                        cam_params[3] -= crop_h_start
+                    else:
+                        real_shape[0] = resize_shape[1]
+
             sample['rgb'][idx] = rgb
+
+            # Project point cloud into virtual image plane placed at random 'initial_calib'
+            depth_img_no_occlusion, uv, indexes, depth = prepare_input(cam_params, pc_rotated, real_shape,
+                                                                       reflectance, _config)
+            
+            cam_model = CameraModel()
+            cam_model.focal_length = cam_params[:2]
+            cam_model.principal_point = cam_params[2:]
+
+            # GT flow 만들기: RT가 유발한 픽셀 이동량 계산
+            flow, points_3D, new_indexes = get_flow_zforward(uv.float(), depth[indexes], RT1_inv, cam_model,
+                                                             [real_shape[0], real_shape[1], 3],
+                                                             scale_flow=False, reverse=False,
+                                                             get_valid_indexes=True)
+
+            uv = uv[new_indexes].clone()
+            flow = flow[new_indexes].clone()
+            points_3D = points_3D[new_indexes].clone()
+
+            valid_uv = (uv[:, 0] >= 0) & (uv[:, 1] >= 0)
+            valid_uv = valid_uv & (uv[:, 0] < real_shape[1]) & (uv[:, 1] < real_shape[0])
+            if not torch.all(valid_uv):
+                uv = uv[valid_uv]
+                flow = flow[valid_uv]
+                points_3D = points_3D[valid_uv]
+
 
             flow_img = torch.zeros((real_shape[0], real_shape[1], 2), device='cuda', dtype=torch.float)
             flow_img[uv[:, 1], uv[:, 0]] = flow
@@ -413,7 +487,6 @@ def evaluate_calibration(_config, seed):
             else:
                 viz_initial_np = None
 
-            points_3D = points_3D[new_indexes].clone()
             rgb, depth_img_no_occlusion, flow_img, flow_mask = downsample_and_pad(_config, rgb, depth_img_no_occlusion,
                                                                                   img_shape, real_shape, flow_img,
                                                                                   flow_mask)
@@ -453,7 +526,7 @@ def evaluate_calibration(_config, seed):
 
             up_flow = up_flow[0].permute(1, 2, 0)
 
-            new_uv = uv.float() + up_flow[uv[:, 1], uv[:, 0]]
+            new_uv = uv.float() + up_flow[uv[:, 1], uv[:, 0]] # uv는 픽셀좌표
 
             valid_indexes = flow_mask[uv[:, 1], uv[:, 0]] == 1
 
@@ -825,18 +898,20 @@ def main():
     parser.add_argument('--quantile', type=float, default=1.0)
     parser.add_argument('--downsample', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--viz', type=str2bool, nargs='?', const=True, default=False)
-    parser.add_argument('--dataset_name', type=str, default='KITTI')
     parser.add_argument('--data_id', type=str, default='00')
     parser.add_argument('--test_topics', type=str, default='default')
-    parser.add_argument('--sensor_type', type=str, default='lidar')
+    parser.add_argument('--data_type', type=str, default='default')
+    parser.add_argument('--image_name', type=str, default='image_left')
+    parser.add_argument('--pcl_name', type=str, default='lidar_top')
     parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--fix_error', type=str2bool, nargs='?', const=True, default=False)
 
 
     args = parser.parse_args()
     _config = vars(args)
 
     global output_dir
-    output_dir = os.path.join('/ws/output/', args.dataset_name, args.data_id, args.test_topics)
+    output_dir = os.path.join('/ws/output/', args.dataset, 'test', args.test_topics)
     print(f"Results will be saved in {output_dir}")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)

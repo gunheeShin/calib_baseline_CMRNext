@@ -479,18 +479,24 @@ def main(gpu, _config, common_seed, world_size):
 
             dataset_train = dataset_custom
 
-        elif _config['dataset'] == 'hercules':
-            train_directories_hercules = []
-            # for subdir in ['library_1', 'library_3', 'parking_lot_1', 'parking_lot_4', 'SC_1', 'SC_3', 'island_1', 'island_2']:
-            for subdir in ['parking_lot_1']:
-                train_directories_hercules.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'offline'))
+        elif _config['data_type'] == 'lg_custom':
 
-            dataset_hercules = DatasetGeneralExtrinsicCalib(train_directories_hercules, train=True, max_r=_config['max_r'],
+            if _config['dataset'] == 'hercules':
+                subdir_list = ['parking_lot_1']
+            elif _config['dataset'] == 'lg_innotek':
+                subdir_list = ['001']
+
+            train_directories_lg_custom = []
+            for subdir in subdir_list:
+                train_directories_lg_custom.append(os.path.join(_config['data_folder_custom'], _config['dataset'], subdir, 'offline'))
+
+
+            dataset_lg_custom = DatasetGeneralExtrinsicCalib(train_directories_lg_custom, train=True, max_r=_config['max_r'],
                                                          max_t=_config['max_t'],
                                                          use_reflectance=_config['use_reflectance'],
                                                          normalize_images=_config['normalize_images'],
-                                                         dataset='hercules', sensor_type=_config['sensor_type'], downsample=_config['downsize'])
-            dataset_train = dataset_hercules
+                                                         dataset=_config['dataset'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], data_type=_config['data_type'])
+            dataset_train = dataset_lg_custom
 
         else:
             train_directories_kitti = []
@@ -571,19 +577,23 @@ def main(gpu, _config, common_seed, world_size):
 
             print ("Len Custom Val Dataset: ", len(dataset_val))
         
-        elif _config['dataset'] == 'hercules':
-            test_directories_hercules = []
-            # for subdir in ['parking_lot_2']:
-            for subdir in ['parking_lot_1']:
-                test_directories_hercules.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'offline'))
+        elif _config['data_type'] == 'lg_custom':
+            if _config['dataset'] == 'hercules':
+                subdir_list = ['parking_lot_1']
+            elif _config['dataset'] == 'lg_innotek':
+                subdir_list = ['002']
 
-            dataset_val_hercules = DatasetGeneralExtrinsicCalib(test_directories_hercules, train=True, max_r=_config['max_r'],
+            test_directories_lg_custom = []
+            for subdir in subdir_list:
+                test_directories_lg_custom.append(os.path.join(_config['data_folder_custom'], _config['dataset'], subdir, 'offline'))
+
+            dataset_val_lg_custom = DatasetGeneralExtrinsicCalib(test_directories_lg_custom, train=True, max_r=_config['max_r'],
                                                           max_t=_config['max_t'],
                                                           use_reflectance=_config['use_reflectance'],
                                                           normalize_images=_config['normalize_images'],
-                                                          dataset='hercules',sensor_type=_config['sensor_type'], downsample=_config['downsize'])
+                                                          dataset=_config['dataset'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], data_type=_config['data_type'])
 
-            dataset_val = dataset_val_hercules
+            dataset_val = dataset_val_lg_custom
 
             print ("Len Hercules Val Dataset: ", len(dataset_val))
 
@@ -797,7 +807,11 @@ def main(gpu, _config, common_seed, world_size):
                         aligned_raw_rgb = np.clip(aligned_rgb_np, 0, 255).astype(np.uint8)
                     pc_overlay = _depth_overlay(depth_img_no_occlusion, raw_rgb)
                     aligned_overlay = _depth_overlay(aligned_img_no_occlusion, aligned_raw_rgb)
-                    flow_arrows = _flow_arrows(flow_img, flow_mask, raw_rgb)
+                    if 'lidar' in _config['pcl_name']:
+                        step= 20
+                    elif 'radar' in _config['pcl_name']:
+                        step= 1
+                    flow_arrows = _flow_arrows(flow_img, flow_mask, raw_rgb, step=step)
                     concat_img = np.concatenate([aligned_overlay, pc_overlay, flow_arrows], axis=1)
                     io.imsave(os.path.join(debug_input_data_dir, f"{base_name}_debug_concat.png"), concat_img)
 
@@ -1110,11 +1124,13 @@ def real_main():
     parser.add_argument('--finetune', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--find_unused_parameter', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--context_encoder', type=str, default="lidar", choices=["lidar"])
-    parser.add_argument('--sensor_type', type=str, default="lidar")
     parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--crop_mode', type=int, default=0)
-    parser.add_argument('--dataset', type=str, default="kitti")
     parser.add_argument('--save_dir', type=str, default='./logs/')
+    parser.add_argument('--dataset', type=str, default="kitti")
+    parser.add_argument('--data_type', type=str, default='default')
+    parser.add_argument('--image_name', type=str, default='image_left')
+    parser.add_argument('--pcl_name', type=str, default='velodyne_left')
 
     args = parser.parse_args()
     # print(args)

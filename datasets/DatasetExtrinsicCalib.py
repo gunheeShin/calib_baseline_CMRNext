@@ -186,12 +186,13 @@ def get_extrinsic_pandaset(camera):
 class DatasetGeneralExtrinsicCalib(Dataset):
 
     def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=2., max_r=10.,
-                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False, sensor_type='lidar', downsample=False):
+                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False,data_type='default', image_name='image_left', pcl_name='lidar', downsample=False, fix_error =False):
         super(DatasetGeneralExtrinsicCalib, self).__init__()
         self.dataset = dataset
         self.use_reflectance = use_reflectance
         self.max_r = max_r
         self.max_t = max_t
+        self.fix_error = fix_error
         self.augmentation = augmentation
         self.root_dirs = dataset_dirs
         self.transform = transform
@@ -210,15 +211,16 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             self.extension = '.ply'
             self.sdbs = {}
         elif dataset == 'custom':
-            self.maps_folder = sensor_type
+            self.maps_folder = pcl_name
             if downsample:
                 self.camera_folder = 'Downsample/camera'
             else:
                 self.camera_folder = 'camera'
-        elif dataset == 'hercules':
-            self.maps_folder = sensor_type
-            self.camera_folder = 'image_left'
+        elif data_type == 'lg_custom':
+            self.maps_folder = pcl_name
+            self.camera_folder = image_name
             self.downsample = downsample
+            self.data_type = data_type
 
         self.all_files = []
         self.synced_stamps = []
@@ -266,8 +268,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                         continue
                     self.all_files.append(os.path.join(img_folder, filename))
 
-            if dataset == 'hercules':
-                with open(os.path.join(directory, 'calibration.yaml')) as f:
+            if data_type == 'lg_custom':
+                with open(os.path.join(directory, '../..', 'calibration.yaml')) as f:
                     file_data = yaml.safe_load(f)
 
                 self.camera_intrinsics = torch.tensor(
@@ -282,7 +284,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 img_folder = os.path.join(directory, self.camera_folder)
                 point_cloud_folder = os.path.join(directory, self.maps_folder)
 
-                synced_stamp_path = os.path.join(directory, 'synced_stamps', 'image_left_' + self.maps_folder + '.txt')
+                synced_stamp_path = os.path.join(directory, 'synced_stamps', self.camera_folder + '_' + self.maps_folder + '.txt')
                 with open(synced_stamp_path, 'r') as f:
                     for line in f.read().splitlines():
                         
@@ -296,9 +298,19 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                         image_stamp, maps_stamp = parts[0], parts[1]
                         self.synced_stamps.append((directory, image_stamp, maps_stamp))
 
-                        if len(self.synced_stamps) >100:
-                            break
                     print(f"Loaded {len(self.synced_stamps)} synced stamps from {synced_stamp_path}")
+
+        if self.fix_error:
+            self.fixed_errors = []
+            for _ in range(self.__len__()):
+                rotz = np.random.uniform(-self.max_r, self.max_r) * (3.141592 / 180.0)
+                roty = np.random.uniform(-self.max_r, self.max_r) * (3.141592 / 180.0)
+                rotx = np.random.uniform(-self.max_r, self.max_r) * (3.141592 / 180.0)
+                transl_x = np.random.uniform(-self.max_t, self.max_t)
+                transl_y = np.random.uniform(-self.max_t, self.max_t)
+                transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
+                self.fixed_errors.append((rotx, roty, rotz, transl_x, transl_y, transl_z))
+            print(f"Using fixed errors : {self.fixed_errors[0]} ...")
 
     def custom_transform(self, rgb, calib, img_rotation=0., flip=False):
         if self.train:
@@ -315,7 +327,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         return torch.tensor(rgb).float()
 
     def __len__(self):
-        if self.dataset == 'hercules':
+        if self.data_type == 'lg_custom':
             return len(self.synced_stamps)
         return len(self.all_files)
 
@@ -327,7 +339,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             pc_path = img_path.replace(f'/{self.camera_folder}/', f'/{self.maps_folder}/').replace(extension,
                                                                                                    self.extension)
             
-        elif self.dataset == 'hercules':
+        elif self.data_type == 'lg_custom':
             # read stamps from self.synced_stamps
             directory, image_stamp, maps_stamp = self.synced_stamps[idx]
             img_path = os.path.join(directory, 'sensor_data', self.camera_folder, f'{image_stamp}.png')
@@ -374,7 +386,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 print("[ERROR], Point cloud has less than 3 channels")
                 sys.exit(1)
 
-        elif self.dataset == 'hercules':
+        elif self.data_type == 'lg_custom':
             pc = self.point_cloud_reader(pc_path)
             cam2vel = self.initial_extrinsic
             calib = self.camera_intrinsics.clone()
@@ -433,13 +445,16 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             T = mathutils.Vector((0., 0., 0.))
             pc_in = rotate_forward(pc_in, R, T)
 
-        max_angle = self.max_r
-        rotz = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
-        roty = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
-        rotx = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
-        transl_x = np.random.uniform(-self.max_t, self.max_t)
-        transl_y = np.random.uniform(-self.max_t, self.max_t)
-        transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
+        if self.fix_error:
+            rotx, roty, rotz, transl_x, transl_y, transl_z = self.fixed_errors[idx]
+        else:
+            max_angle = self.max_r
+            rotz = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
+            roty = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
+            rotx = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
+            transl_x = np.random.uniform(-self.max_t, self.max_t)
+            transl_y = np.random.uniform(-self.max_t, self.max_t)
+            transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
 
         if self.change_frame:
             R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
