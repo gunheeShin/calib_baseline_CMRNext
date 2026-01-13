@@ -1,7 +1,6 @@
 python3 evaluate_flow_calibration.py \
-	    --weights /ws/data/LG_Innotek/PublicDataset/checkpoints/checkpoint_22_19.290.tar \
-	    --data_folder /ws/data/LG_Innotek/PublicDataset \
-	    --num_worker 1 \
+	    --weights /ws/data/checkpoints/cmrnext_kittiArgoversePandasetHercules_5_0.5_251110.tar \
+	    --data_folder /ws/data \
 	    --quantile 1.0 \
 	    --max_t 0.5 \
 	    --max_r 5 \

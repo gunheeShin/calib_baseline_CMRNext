@@ -261,7 +261,7 @@ def evaluate_calibration(_config, seed):
     elif _config['data_type'] == 'lg_custom':
         
         if _config['dataset'] == 'hercules':
-            subdir_list = ['parking_lot_1']
+            subdir_list = ['parking_lot_1', 'parking_lot_2', 'parking_lot_4', 'library_3']
         elif _config['dataset'] == 'lg_innotek':
             subdir_list = ['001']
         

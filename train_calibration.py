@@ -451,7 +451,7 @@ def main(gpu, _config, common_seed, world_size):
     std = torch.tensor([0.229, 0.224, 0.225]).to(device)
 
     debug_save_dir = _config['save_dir'] + "/"
-    debug_save_dir += _config['dataset'] + "/train/"
+    debug_save_dir += _config['dataset'] + "/train/" + _config['save_model_name'] + "/"
     if not os.path.exists(debug_save_dir):
         os.makedirs(debug_save_dir)
     else:
@@ -482,7 +482,7 @@ def main(gpu, _config, common_seed, world_size):
         elif _config['data_type'] == 'lg_custom':
 
             if _config['dataset'] == 'hercules':
-                subdir_list = ['parking_lot_1']
+                subdir_list = ['SC_1', 'SC_3', 'island_1']
             elif _config['dataset'] == 'lg_innotek':
                 subdir_list = ['001']
 
@@ -579,7 +579,7 @@ def main(gpu, _config, common_seed, world_size):
         
         elif _config['data_type'] == 'lg_custom':
             if _config['dataset'] == 'hercules':
-                subdir_list = ['parking_lot_1']
+                subdir_list = ['library_1']
             elif _config['dataset'] == 'lg_innotek':
                 subdir_list = ['002']
 
@@ -1032,7 +1032,8 @@ def main(gpu, _config, common_seed, world_size):
             }, f'{_config["savemodel"]}/last_iter_checkpoint.tar')
         if val_epe < BEST_VAL_EPE and rank == 0:
             BEST_VAL_EPE = val_epe
-            savefilename = f'{_config["savemodel"]}/checkpoint_{epoch}_{val_epe:.3f}.tar'
+            # savefilename = f'{_config["savemodel"]}/checkpoint_{epoch}_{val_epe:.3f}.tar'
+            savefilename = f'{_config["savemodel"]}/{_config["save_model_name"]}_{epoch}_{val_epe:.3f}.tar'
             torch.save({
                 'config': _config,
                 'epoch': epoch,
@@ -1127,6 +1128,7 @@ def real_main():
     parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--crop_mode', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./logs/')
+    parser.add_argument('--save_model_name', type=str, default='cmrnext_calibration')
     parser.add_argument('--dataset', type=str, default="kitti")
     parser.add_argument('--data_type', type=str, default='default')
     parser.add_argument('--image_name', type=str, default='image_left')
