@@ -20,11 +20,43 @@ from pandaset.geometry import _heading_position_to_mat
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from utils import invert_pose, rotate_forward, to_rotation_matrix
+from utils import invert_pose, rotate_forward, to_rotation_matrix, quaternion_from_matrix, tvector2mat
 
 logging.getLogger('argoverse').setLevel(logging.ERROR)
 
 import open3d as o3d
+
+
+def se3_exp_map(omega, v):
+    """
+    Computes the exponential map for SE(3).
+    :param omega: Rotation vector (axis-angle), shape (3,) [radians]
+    :param v: Translation vector component (in tangent space), shape (3,) [meters]
+    :return: 4x4 Transformation Matrix
+    """
+    theta = np.linalg.norm(omega)
+    K = np.zeros((3, 3))
+    K[0, 1] = -omega[2]
+    K[0, 2] = omega[1]
+    K[1, 0] = omega[2]
+    K[1, 2] = -omega[0]
+    K[2, 0] = -omega[1]
+    K[2, 1] = omega[0]
+
+    I = np.eye(3)
+    if theta < 1e-6:
+        R = I + K
+        V = I + 0.5 * K
+    else:
+        R = I + (np.sin(theta) / theta) * K + ((1 - np.cos(theta)) / (theta ** 2)) * (K @ K)
+        V = I + ((1 - np.cos(theta)) / (theta ** 2)) * K + ((theta - np.sin(theta)) / (theta ** 3)) * (K @ K)
+
+    t = V @ v
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return torch.tensor(T, dtype=torch.float32)
+
 
 class ReadOpen3d:
     def __call__(self, file):
@@ -186,9 +218,10 @@ def get_extrinsic_pandaset(camera):
 class DatasetGeneralExtrinsicCalib(Dataset):
 
     def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=2., max_r=10.,
-                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False,data_type='default', image_name='image_left', pcl_name='lidar', downsample=False, fix_error =False):
+                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False,data_type='default', image_name='image_left', pcl_name='lidar', downsample=False, fix_error =False, error_file=None, error_idx=0):
         super(DatasetGeneralExtrinsicCalib, self).__init__()
         self.dataset = dataset
+        self.data_type = data_type
         self.use_reflectance = use_reflectance
         self.max_r = max_r
         self.max_t = max_t
@@ -300,17 +333,31 @@ class DatasetGeneralExtrinsicCalib(Dataset):
 
                     print(f"Loaded {len(self.synced_stamps)} synced stamps from {synced_stamp_path}")
 
+        self.use_error_file = False
         if self.fix_error:
-            self.fixed_errors = []
-            for _ in range(self.__len__()):
+            if error_file is not None:
+                with open(error_file, 'r') as f:
+                    lines = f.readlines()
+                    if 0 <= error_idx < len(lines):
+                        values = list(map(float, lines[error_idx].strip().split()))
+                        # Assume input is: omega_x, omega_y, omega_z (degree), v_x, v_y, v_z (meter)
+                        # We store them as is for now, conversion happens in __getitem__ or se3_exp_map call
+                        omega = np.array(values[:3])
+                        v = np.array(values[3:])
+                        self.fixed_errors = (omega, v)
+                        self.use_error_file = True
+                        print(f"Using FIXED SE(3) error from FILE {error_file} (idx {error_idx}): w={omega}(deg), v={v}(m)")
+                    else:
+                        raise ValueError(f"Invalid error_idx {error_idx} for file {error_file} with {len(lines)} lines")
+            else:
                 rotz = np.random.uniform(-self.max_r, self.max_r) * (3.141592 / 180.0)
                 roty = np.random.uniform(-self.max_r, self.max_r) * (3.141592 / 180.0)
                 rotx = np.random.uniform(-self.max_r, self.max_r) * (3.141592 / 180.0)
                 transl_x = np.random.uniform(-self.max_t, self.max_t)
                 transl_y = np.random.uniform(-self.max_t, self.max_t)
                 transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
-                self.fixed_errors.append((rotx, roty, rotz, transl_x, transl_y, transl_z))
-            print(f"Using fixed errors : {self.fixed_errors[0]} ...")
+                self.fixed_errors = (rotx, roty, rotz, transl_x, transl_y, transl_z)
+                print(f"Using FIXED error for ALL frames : {self.fixed_errors} ...")
 
     def custom_transform(self, rgb, calib, img_rotation=0., flip=False):
         if self.train:
@@ -445,8 +492,53 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             T = mathutils.Vector((0., 0., 0.))
             pc_in = rotate_forward(pc_in, R, T)
 
-        if self.fix_error:
-            rotx, roty, rotz, transl_x, transl_y, transl_z = self.fixed_errors[idx]
+        if self.fix_error and self.use_error_file:
+            omega_deg, v = self.fixed_errors
+            omega_rad = omega_deg * (np.pi / 180.0)
+            
+            # dT = exp([omega, v]) in SE(3)
+            dT = se3_exp_map(omega_rad, v) # 4x4 tensor
+            
+            # T_GT = cam2vel (assuming cam2vel takes point from Lidar/Sensor to Camera)
+            # Check type of cam2vel
+            T_GT = cam2vel
+            if not isinstance(T_GT, torch.Tensor):
+                T_GT = torch.tensor(T_GT, dtype=torch.float32)
+            
+            # M = T_GT * dT * T_GT^-1
+            # extrinsic_error in evaluate code is M.
+            # We need to return components of M^-1 (because code does RT1_inv = T*R, then extrinsic_error = RT1_inv.inverse())
+            # So RT1_inv = M^-1
+            
+            M = torch.mm(T_GT, torch.mm(dT, T_GT.inverse()))
+            M_inv = M.inverse()
+            
+            # Decompose M_inv into Translation T and Rotation R
+            # M_inv = [R  t]
+            #         [0  1]
+            # But code expects RT1_inv = T_mat * R_mat (where T_mat is translation only, R_mat is rotation only)
+            # T_mat * R_mat = [I t] * [R 0] = [R t]
+            #                 [0 1]   [0 1]   [0 1]
+            # So yes, standard decomposition fits.
+            
+            # Extract rotation and translation
+            R_mat = M_inv[:3, :3] # 3x3
+            T_vec = M_inv[:3, 3]  # 3
+            
+            R = quaternion_from_matrix(R_mat) # vector 4
+            T = T_vec # vector 3
+            
+        elif self.fix_error:
+            rotx, roty, rotz, transl_x, transl_y, transl_z = self.fixed_errors
+            # Fallback to Euler perturbation logic
+            if self.change_frame:
+                R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
+                T = mathutils.Vector((transl_x, transl_y, transl_z))
+            else:
+                R = mathutils.Euler((roty, rotz, rotx), 'XYZ')
+                T = mathutils.Vector((transl_y, transl_z, transl_x))
+            R, T = invert_pose(R, T)
+            R, T = torch.tensor(R), torch.tensor(T)
         else:
             max_angle = self.max_r
             rotz = np.random.uniform(-max_angle, max_angle) * (3.141592 / 180.0)
@@ -456,16 +548,14 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             transl_y = np.random.uniform(-self.max_t, self.max_t)
             transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
 
-        if self.change_frame:
-            R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
-            T = mathutils.Vector((transl_x, transl_y, transl_z))
-        else:
-            R = mathutils.Euler((roty, rotz, rotx), 'XYZ')
-            T = mathutils.Vector((transl_y, transl_z, transl_x))
-
-
-        R, T = invert_pose(R, T)
-        R, T = torch.tensor(R), torch.tensor(T)
+            if self.change_frame:
+                R = mathutils.Euler((rotx, roty, rotz), 'XYZ')
+                T = mathutils.Vector((transl_x, transl_y, transl_z))
+            else:
+                R = mathutils.Euler((roty, rotz, rotx), 'XYZ')
+                T = mathutils.Vector((transl_y, transl_z, transl_x))
+            R, T = invert_pose(R, T)
+            R, T = torch.tensor(R), torch.tensor(T)
 
         sample = {'rgb': img, 'point_cloud': pc_in, 'calib': calib, 'tr_error': T,
                   'rot_error': R, 'rgb_name': img_path, 'idx': idx, 'cam2vel': cam2vel}

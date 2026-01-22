@@ -12,6 +12,7 @@ from PIL import Image
 
 import cv2
 import numpy as np
+import collections
 
 import torch
 import torch.nn.parallel
@@ -305,7 +306,8 @@ def evaluate_calibration(_config, seed):
         dataset_val = DatasetGeneralExtrinsicCalib(val_directories, train=False, max_r=_config['max_r'],
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
                                                    normalize_images=_config['normalize_images'],
-                                                   dataset=_config['dataset'], cam=_config['cam'], sensor_type=_config['sensor_type'], downsample=_config['downsize'])
+                                                   dataset=_config['dataset'], cam=_config['cam'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], fix_error=_config['fix_error'],
+                                                   error_file=_config['error_file'], error_idx=_config['error_idx'])
     elif _config['data_type'] == 'lg_custom':
         dataset_val = DatasetGeneralExtrinsicCalib(val_directories, train=False, max_r=_config['max_r'],
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
@@ -357,6 +359,11 @@ def evaluate_calibration(_config, seed):
         list_transl.append([])
         epe.append([])
         final_calib_RTs.append([])
+
+    # Queues to store correspondences for temporal aggregation (or sliding window PnP)
+    # Each iteration step has its own queue.
+    point_queues = [collections.deque(maxlen=_config['accumulate_frames']) for _ in range(len(_config['weights']))]
+
     tbar = tqdm(TestImgLoader)
     idex = 0
     for batch_idx, sample in enumerate(tbar):
@@ -640,8 +647,18 @@ def evaluate_calibration(_config, seed):
 
             # Predict relative transformation based on CMRNext correspondences
             # for iterative refinement
-            cuda_pnp = cv2.pythoncuda.cudaPnP(obj_coord_zforward.astype(np.float32).copy(),
-                                              points_2d.astype(np.float32).copy(), obj_coord_zforward.shape[0],
+
+            # Add current correspondences to the queue
+            point_queues[iteration].append((obj_coord_zforward.astype(np.float32), points_2d.astype(np.float32)))
+
+            # Concatenate all correspondences in the queue
+            acc_obj_coord = np.concatenate([x[0] for x in point_queues[iteration]])
+            acc_points_2d = np.concatenate([x[1] for x in point_queues[iteration]])
+
+            # print("size of point_queues: ", len(point_queues[iteration]))
+
+            cuda_pnp = cv2.pythoncuda.cudaPnP(acc_obj_coord,
+                                              acc_points_2d, acc_obj_coord.shape[0],
                                               200, 2., cam_mat.astype(np.float32)
                                               )
 
@@ -904,7 +921,11 @@ def main():
     parser.add_argument('--image_name', type=str, default='image_left')
     parser.add_argument('--pcl_name', type=str, default='lidar_top')
     parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--sensor_type', type=str, default='lidar')
     parser.add_argument('--fix_error', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--accumulate_frames', type=int, default=1, help='Number of frames to accumulate correspondences for PnP')
+    parser.add_argument('--error_file', type=str, default=None, help='Path to the file containing fixed errors')
+    parser.add_argument('--error_idx', type=int, default=0, help='Index of the error to use from the error file')
 
 
     args = parser.parse_args()

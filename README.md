@@ -209,6 +209,30 @@ If you see no points projection in the top image, or if the points are flipped 9
 
 The `--downsample` argument should give better results for most use cases, but if your camera images looks similar to the ones in the KITTI dataset, then you might try removing the argument and check if the results are better.
 
+### Advanced Calibration Evaluation
+
+We provide additional arguments for more controlled evaluation and robust inference:
+
+#### Fixed Error Evaluation
+To evaluate calibration with a specific, pre-defined initial error (instead of random generation), use the following arguments:
+- `--fix_error`: Enable loading a fixed error from a file.
+- `--error_file`: Path to a text file containing error vectors (6 values per line: 3 for rotation in degrees, 3 for translation in meters, representing SE(3) Lie algebra).
+- `--error_idx`: The 0-based index (line number) of the error to apply from the file.
+
+Example:
+```bash
+python3 evaluate_flow_calibration.py ... --fix_error --error_file ./init_errors/5.0_0.5.txt --error_idx 0
+```
+
+#### Temporal Accumulation
+To improve Robustness, you can accumulate correspondences over multiple frames for the PnP solver:
+- `--accumulate_frames N`: Accumulate correspondences from the current frame and the previous N-1 frames.
+
+Example:
+```bash
+python3 evaluate_flow_calibration.py ... --accumulate_frames 5
+```
+
 ### Extrinsic Calibration Training
 To train the Camera-LiDAR extrinsic calibration models, run the following commands:
 ```bash
