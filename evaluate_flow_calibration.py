@@ -415,8 +415,8 @@ def evaluate_calibration(_config, seed):
 
             cam_params = sample['calib'][idx].cuda()
 
-            # Scale(Upsample or downsample) for Hercules dataset according to focal length
-            if _config['dataset'] == 'hercules' and _config['downsize'] == True:
+            # Scale(Upsample or downsample) according to resize_mode
+            if _config['resize_mode'] == 1:
                 target_fx, target_fy = 718.5377, 718.5377
                 scale_x = float(target_fx) / float(cam_params[0])
                 scale_y = float(target_fy) / float(cam_params[1])
@@ -448,6 +448,20 @@ def evaluate_calibration(_config, seed):
                         cam_params[3] -= crop_h_start
                     else:
                         real_shape[0] = resize_shape[1]
+            elif _config['resize_mode'] == 2:
+                # downsample by 2, ensuring dimensions are divisible by 8 for RAFT
+                new_h = (real_shape[0] // 2) // 8 * 8
+                new_w = (real_shape[1] // 2) // 8 * 8
+                scale_h = new_h / real_shape[0]
+                scale_w = new_w / real_shape[1]
+                cam_params[0] = cam_params[0] * scale_w
+                cam_params[1] = cam_params[1] * scale_h
+                cam_params[2] = cam_params[2] * scale_w
+                cam_params[3] = cam_params[3] * scale_h
+                rgb = rgb.unsqueeze(0)
+                rgb = F.interpolate(rgb, size=(new_h, new_w), mode='bilinear', align_corners=True)[0]
+                real_shape[0] = new_h
+                real_shape[1] = new_w
 
             sample['rgb'][idx] = rgb
 
@@ -927,6 +941,7 @@ def main():
     parser.add_argument('--error_file', type=str, default=None, help='Path to the file containing fixed errors')
     parser.add_argument('--error_idx', type=int, default=0, help='Index of the error to use from the error file')
 
+    parser.add_argument('--resize_mode', type=int, default=0)  # 0: No resize, 1: resize according to target focal, 2: downsample by 2
 
     args = parser.parse_args()
     _config = vars(args)

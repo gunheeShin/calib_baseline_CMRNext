@@ -102,7 +102,7 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
     cam_model.principal_point = cam_params[2:]
 
     # Scale(Upsample or downsample) for Hercules dataset according to focal length
-    if _config['dataset'] == 'hercules' and _config['downsize'] == True:
+    if _config['resize_mode'] == 1:
         target_fx, target_fy = 718.5377, 718.5377
         scale_x = float(target_fx) / float(cam_params[0])
         scale_y = float(target_fy) / float(cam_params[1])
@@ -132,7 +132,18 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
                 cam_model.principal_point[1] -= crop_h_start
             else:
                 real_shape[0] = resize_shape[1]
-                
+    elif _config['resize_mode'] == 2:
+        # downsample by 2, ensuring dimensions are divisible by 8 for RAFT
+        new_h = (real_shape[0] // 2) // 8 * 8
+        new_w = (real_shape[1] // 2) // 8 * 8
+        scale_h = new_h / real_shape[0]
+        scale_w = new_w / real_shape[1]
+        cam_model.focal_length = torch.tensor([cam_params[0] * scale_w, cam_params[1] * scale_h], device=device)
+        cam_model.principal_point = torch.tensor([cam_params[2] * scale_w, cam_params[3] * scale_h], device=device)
+        rgb = rgb.unsqueeze(0)
+        rgb = F.interpolate(rgb, size=(new_h, new_w), mode='bilinear', align_corners=True)[0]
+        real_shape[0] = new_h
+        real_shape[1] = new_w
 
     uv_lidar, depth, _, refl = cam_model.project_pytorch(pc_rotated, real_shape, reflectance)
     uv_lidar = uv_lidar.t().int().contiguous()
@@ -1126,6 +1137,7 @@ def real_main():
     parser.add_argument('--find_unused_parameter', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--context_encoder', type=str, default="lidar", choices=["lidar"])
     parser.add_argument('--downsize', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--resize_mode', type=int, default=0) # 0: No resize, 1: resize according to target focal, 2: downsample by 2
     parser.add_argument('--crop_mode', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./logs/')
     parser.add_argument('--save_model_name', type=str, default='cmrnext_calibration')

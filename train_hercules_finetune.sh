@@ -10,6 +10,7 @@ python3 train_calibration.py \
     --BASE_LEARNING_RATE 3e-5 \
     --batch_size 4 \
     --crop_mode 1 \
+    --resize_mode 1  \
     --save_dir /ws/output  \
     --save_model_name cmrnext_kittiArgoversePandasetHerculesRadar_5_0.5_251110_woDownsize \
     --dataset hercules  \

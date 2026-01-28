@@ -10,3 +10,4 @@ python3 evaluate_flow_calibration.py \
 	    --image_name image_left \
 	    --pcl_name radar_Continental \
 		--fix_error False \
+		--resize_mode 2 \
