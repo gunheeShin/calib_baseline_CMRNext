@@ -318,6 +318,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 point_cloud_folder = os.path.join(directory, self.maps_folder)
 
                 synced_stamp_path = os.path.join(directory, 'synced_stamps', self.camera_folder + '_' + self.maps_folder + '.txt')
+                synced_stamps_init_num = len(self.synced_stamps)
                 with open(synced_stamp_path, 'r') as f:
                     for line in f.read().splitlines():
                         
@@ -331,8 +332,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                         image_stamp, maps_stamp = parts[0], parts[1]
                         self.synced_stamps.append((directory, image_stamp, maps_stamp))
 
-                    print(f"Loaded {len(self.synced_stamps)} synced stamps from {synced_stamp_path}")
-
+                    print(f"Loaded {len(self.synced_stamps) - synced_stamps_init_num} new synced stamps from {synced_stamp_path}")
+        print(f"Total {len(self.synced_stamps)} samples found")
         self.use_error_file = False
         if self.fix_error:
             if error_file is not None:

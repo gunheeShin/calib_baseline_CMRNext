@@ -5,6 +5,8 @@ from itertools import chain
 import os
 import random
 import time
+import uuid
+import re
 
 import mathutils
 import numpy as np
@@ -66,6 +68,20 @@ def uncertainty_to_color(_tensor, mask=None):
     color = jet(total_uncertainty)
     color = color[:, :, :3]
     return color
+
+
+def _sanitize_run_id(value: str) -> str:
+    # Keep it filesystem-friendly and compact
+    value = (value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
+    return value[:128] if value else "run"
+
+
+def _generate_run_id(save_model_name: str) -> str:
+    ts = time.strftime("%y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    base = _sanitize_run_id(save_model_name)
+    return f"{base}_{ts}_{suffix}"
 
 
 def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=False):
@@ -386,23 +402,47 @@ def main(gpu, _config, common_seed, world_size):
     print(f"Process {rank}, seed {common_seed}")
 
     # Setup Weights&Biases
-    wandb_run_id = 'remove'
+    run_id = _config.get('run_id') or _generate_run_id(_config.get('save_model_name', 'run'))
+    run_id = _sanitize_run_id(run_id)
+    _config['run_id'] = run_id
+
     if _config['wandb'] and rank == 0:
+        tags = _config.get('wandb_tags_list')
+        init_kwargs = {
+            "config": _config,
+        }
+        if _config.get('wandb_project'):
+            init_kwargs["project"] = _config['wandb_project']
+        if _config.get('wandb_entity'):
+            init_kwargs["entity"] = _config['wandb_entity']
+        if _config.get('wandb_group'):
+            init_kwargs["group"] = _config['wandb_group']
+        if _config.get('wandb_name'):
+            init_kwargs["name"] = _config['wandb_name']
+        if tags:
+            init_kwargs["tags"] = tags
+
         if _config['resume_id'] is None:
-            wandb.init(config=_config)
+            wandb.init(**init_kwargs)
         else:
-            wandb.init(id=_config['resume_id'], resume="must")
-        wandb_run_id = wandb.run.id
-        print("RUN ID: ", wandb_run_id)
+            wandb.init(id=_config['resume_id'], resume="must", **init_kwargs)
+
+        run_id = wandb.run.id
+        _config['run_id'] = run_id
+        try:
+            wandb.config.update({'run_id': run_id}, allow_val_change=True)
+        except Exception:
+            pass
+        print("RUN ID: ", run_id)
 
     if rank == 0:
-        logger = init_logger(f'/tmp/{wandb_run_id}.log', _config['resume'], _config['wandb'])
+        logger = init_logger(f'/tmp/{run_id}.log', _config['resume'], _config['wandb'])
 
     img_shape = _config['img_shape']
 
     if not os.path.exists(_config["savemodel"]) and rank == 0:
         os.mkdir(_config["savemodel"])
-    _config["savemodel"] = os.path.join(_config["savemodel"], wandb_run_id)
+    _config["savemodel"] = os.path.join(_config["savemodel"], run_id)
     if not os.path.exists(_config["savemodel"]) and rank == 0:
         os.mkdir(_config["savemodel"])
 
@@ -1030,7 +1070,7 @@ def main(gpu, _config, common_seed, world_size):
         # SAVE
         val_epe = total_test_epe / batch_idx
         if rank == 0 and _config['wandb']:
-            wandb.save(f'/tmp/{wandb_run_id}.log')
+            wandb.save(f'/tmp/{run_id}.log')
             torch.save({
                 'config': _config,
                 'epoch': epoch,
@@ -1118,6 +1158,14 @@ def real_main():
     parser.add_argument('--upsample_method', type=str, default="transposed")
     parser.add_argument('--img_shape', type=int, nargs=2, default=[320, 960])
     parser.add_argument('--wandb', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--wandb_project', type=str, default=None)
+    parser.add_argument('--wandb_entity', type=str, default=None)
+    parser.add_argument('--wandb_group', type=str, default=None)
+    parser.add_argument('--wandb_name', type=str, default=None)
+    parser.add_argument('--wandb_tags', type=str, default=None,
+                        help='Comma-separated tags, e.g. "hercules,finetune,radar"')
+    parser.add_argument('--run_id', type=str, default=None,
+                        help='Run identifier for checkpoint/log directories when wandb is disabled (or as fallback).')
     parser.add_argument('--not_normalize_images', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--debug', action='store_true', default=False)
     parser.add_argument('--master_port', type=str, default=None)
@@ -1155,6 +1203,16 @@ def real_main():
         _config['scheduler'] = False
     _config['normalize_images'] = not _config['not_normalize_images']
     _config['subset_argoverse'] = True
+
+    # Normalize wandb tags early (so all ranks see the same config in DDP)
+    tags = []
+    if _config.get('wandb_tags'):
+        tags = [t.strip() for t in _config['wandb_tags'].split(',') if t.strip()]
+    _config['wandb_tags_list'] = tags
+
+    # Ensure a stable, non-colliding run_id when wandb is disabled
+    if not _config.get('run_id'):
+        _config['run_id'] = _generate_run_id(_config.get('save_model_name', 'run'))
 
     if _config['gpu_count'] == -1:
         _config['gpu_count'] = torch.cuda.device_count()
