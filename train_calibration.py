@@ -77,6 +77,15 @@ def _sanitize_run_id(value: str) -> str:
     return value[:128] if value else "run"
 
 
+def _sanitize_run_name(value: str, max_len: int = 80) -> str:
+    # Similar to _sanitize_run_id, but allow empty and keep it shorter so "{name}_{id}" remains readable.
+    value = (value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
+    if not value:
+        return ""
+    return value[:max_len]
+
+
 def _generate_run_id(save_model_name: str) -> str:
     ts = time.strftime("%y%m%d_%H%M%S")
     suffix = uuid.uuid4().hex[:8]
@@ -405,6 +414,7 @@ def main(gpu, _config, common_seed, world_size):
     run_id = _config.get('run_id') or _generate_run_id(_config.get('save_model_name', 'run'))
     run_id = _sanitize_run_id(run_id)
     _config['run_id'] = run_id
+    run_dir = run_id
 
     if _config['wandb'] and rank == 0:
         tags = _config.get('wandb_tags_list')
@@ -429,20 +439,24 @@ def main(gpu, _config, common_seed, world_size):
 
         run_id = wandb.run.id
         _config['run_id'] = run_id
+        # Prefer the explicit CLI-provided name for folder naming. If not provided, keep old behavior (id-only).
+        desired_name = _sanitize_run_name(_config.get('wandb_name') or "")
+        run_dir = f"{desired_name}_{run_id}" if desired_name else run_id
+        run_dir = _sanitize_run_id(run_dir)
         try:
-            wandb.config.update({'run_id': run_id}, allow_val_change=True)
+            wandb.config.update({'run_id': run_id, 'run_dir': run_dir}, allow_val_change=True)
         except Exception:
             pass
         print("RUN ID: ", run_id)
 
     if rank == 0:
-        logger = init_logger(f'/tmp/{run_id}.log', _config['resume'], _config['wandb'])
+        logger = init_logger(f'/tmp/{run_dir}.log', _config['resume'], _config['wandb'])
 
     img_shape = _config['img_shape']
 
     if not os.path.exists(_config["savemodel"]) and rank == 0:
         os.mkdir(_config["savemodel"])
-    _config["savemodel"] = os.path.join(_config["savemodel"], run_id)
+    _config["savemodel"] = os.path.join(_config["savemodel"], run_dir)
     if not os.path.exists(_config["savemodel"]) and rank == 0:
         os.mkdir(_config["savemodel"])
 
@@ -1070,7 +1084,7 @@ def main(gpu, _config, common_seed, world_size):
         # SAVE
         val_epe = total_test_epe / batch_idx
         if rank == 0 and _config['wandb']:
-            wandb.save(f'/tmp/{run_id}.log')
+            wandb.save(f'/tmp/{run_dir}.log')
             torch.save({
                 'config': _config,
                 'epoch': epoch,
