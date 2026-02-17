@@ -515,16 +515,16 @@ def main(gpu, _config, common_seed, world_size):
     mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
     std = torch.tensor([0.229, 0.224, 0.225]).to(device)
 
-    debug_save_dir = _config['save_dir'] + "/"
-    debug_save_dir += _config['dataset'] + "/train/" + _config['save_model_name'] + "/"
-    if not os.path.exists(debug_save_dir):
-        os.makedirs(debug_save_dir)
-    else:
-        import shutil
-        shutil.rmtree(debug_save_dir)
-        os.makedirs(debug_save_dir)
-    debug_input_data_dir = debug_save_dir + "input_data/"
-    os.makedirs(debug_input_data_dir)
+    if _config['debug']:
+        debug_save_dir = _config['save_dir'] + "/"
+        debug_save_dir += _config['dataset'] + "/train/" + _config['save_model_name'] + "/"
+        debug_input_data_dir = debug_save_dir + "input_data/"
+        if rank == 0:
+            if os.path.exists(debug_save_dir):
+                import shutil
+                shutil.rmtree(debug_save_dir, ignore_errors=True)
+            os.makedirs(debug_input_data_dir, exist_ok=True)
+        dist.barrier()
 
     # total_iter = starting_epoch * len(dataset)
     total_iter = 0
