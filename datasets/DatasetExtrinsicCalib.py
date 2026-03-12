@@ -255,6 +255,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             self.downsample = downsample
             self.data_type = data_type
 
+        self.distortion_coeffs = None
+        self.undistort_map = None
         self.all_files = []
         self.synced_stamps = []
 
@@ -308,6 +310,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 self.camera_intrinsics = torch.tensor(
                     [file_data['fx'], file_data['fy'], file_data['cx'], file_data['cy']])
                 self.initial_extrinsic = torch.tensor(file_data['initial_extrinsic'], dtype=torch.float).reshape(4, 4)
+                self.distortion_coeffs = file_data.get('distortion_coeffs', None)
                 first_scan = os.listdir(os.path.join(directory,'sensor_data', self.maps_folder))
                 first_scan = sorted(first_scan)[0]
                 self.extension = os.path.splitext(first_scan)[1]
@@ -359,6 +362,25 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 transl_z = np.random.uniform(-self.max_t, min(self.max_t, 1.))
                 self.fixed_errors = (rotx, roty, rotz, transl_x, transl_y, transl_z)
                 print(f"Using FIXED error for ALL frames : {self.fixed_errors} ...")
+
+    def _undistort_image(self, img_np):
+        if self.distortion_coeffs is None:
+            return img_np
+        fx, fy, cx, cy = self.camera_intrinsics.numpy()
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+        D = list(self.distortion_coeffs)
+        if len(D) == 0:
+            D = [0.0, 0.0, 0.0, 0.0, 0.0]
+        elif len(D) == 2:
+            D = D + [0.0, 0.0, 0.0]
+        elif len(D) == 4:
+            D = D + [0.0]
+        D = np.array(D, dtype=np.float64).reshape(1, -1)
+        h, w = img_np.shape[:2]
+        if self.undistort_map is None:
+            self.undistort_map, _ = cv2.initUndistortRectifyMap(
+                K, D, None, K, (w, h), cv2.CV_32FC2)
+        return cv2.remap(img_np, self.undistort_map, None, cv2.INTER_LINEAR, cv2.BORDER_CONSTANT)
 
     def custom_transform(self, rgb, calib, img_rotation=0., flip=False):
         if self.train:
@@ -466,6 +488,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             pc_in = pc_in[[2, 0, 1, 3], :]
 
         img = Image.open(img_path)
+        if self.data_type == 'lg_custom':
+            img = Image.fromarray(self._undistort_image(np.array(img)))
         h_mirror = False # 좌우 반전
         # if np.random.rand() > 0.5 and self.train:
         #     h_mirror = True
