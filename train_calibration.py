@@ -390,7 +390,21 @@ def test(model, rgb_img, lidar_img, target_flow, target_mask, log_image, _config
     return total_loss.detach(), epe.detach(), ece_u, ece_v, ece_dict, f1
 
 
-def main(gpu, _config, common_seed, world_size):
+def _cleanup_distributed_run(rank, use_wandb):
+    if use_wandb and rank == 0 and wandb.run is not None:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+
+    if dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+
+def _run_main(gpu, _config, common_seed, world_size):
     global EPOCH
     rank = gpu
 
@@ -1042,6 +1056,13 @@ def main(gpu, _config, common_seed, world_size):
         # Cleanup
         del sample, dataset_train, dataset_val, TrainImgLoader
 
+
+def main(gpu, _config, common_seed, world_size):
+    try:
+        _run_main(gpu, _config, common_seed, world_size)
+    finally:
+        _cleanup_distributed_run(gpu, _config['wandb'])
+
     if rank == 0:
         logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
 
@@ -1148,10 +1169,14 @@ def real_main():
     if args.master_port is not None:
         _config['MASTER_PORT'] = args.master_port
     os.environ['MASTER_PORT'] = _config['MASTER_PORT']
-    if _config['gpu'] == -1:
-        mp.spawn(main, nprocs=world_size, args=(_config, _config['seed'], world_size,))
-    else:
-        main(_config['gpu'], _config, _config['seed'], world_size)
+    try:
+        if _config['gpu'] == -1:
+            mp.spawn(main, nprocs=world_size, args=(_config, _config['seed'], world_size,))
+        else:
+            main(_config['gpu'], _config, _config['seed'], world_size)
+    except KeyboardInterrupt:
+        print("Training interrupted, shutting down distributed workers.")
+        raise SystemExit(130)
 
 
 if __name__ == '__main__':
