@@ -99,6 +99,15 @@ def _all_reduce_sums(metric_sums: torch.Tensor) -> torch.Tensor:
     return reduced
 
 
+def _rasterize_sparse_flow(shape_hw, uv_flow, flow, device):
+    flow_img = torch.zeros((shape_hw[0], shape_hw[1], 2), device=device, dtype=torch.float)
+    flow_mask = torch.zeros((shape_hw[0], shape_hw[1]), device=device, dtype=torch.int)
+    if uv_flow.numel() > 0:
+        flow_img[uv_flow[:, 1], uv_flow[:, 0]] = flow
+        flow_mask[uv_flow[:, 1], uv_flow[:, 0]] = 1
+    return flow_img, flow_mask
+
+
 def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=False):
     # 샘플 기본 정보와 포인트클라우드 준비
     real_shape = [sample['rgb'][idx].shape[0], sample['rgb'][idx].shape[1], sample['rgb'][idx].shape[2]]
@@ -205,16 +214,23 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
                                              get_valid_indexes=True)
     uv_flow = uv_lidar[new_indexes]
     flow = flow[new_indexes]
+    flow_img = None
+    flow_mask = None
+    argoverse_half_scale = real_shape[1] == 1920 and _config['subset_argoverse']
+    optimized_crop_path = (
+        _config.get('data_type') == 'lg_custom'
+        and _config.get('dataset') == 'hercules'
+        and not _config['use_reflectance']
+        and img_shape is not None
+        and not argoverse_half_scale
+    )
 
-    # dense flow 이미지와 마스크로 “뿌리기”
-    flow_img = torch.zeros((real_shape[0], real_shape[1], 2), device=device, dtype=torch.float)
-    flow_img[uv_flow[:, 1], uv_flow[:, 0]] = flow
-    flow_mask = torch.zeros((real_shape[0], real_shape[1]), device=device, dtype=torch.int)
-    flow_mask[uv_flow[:, 1], uv_flow[:, 0]] = 1
+    if not optimized_crop_path:
+        flow_img, flow_mask = _rasterize_sparse_flow(real_shape[:2], uv_flow, flow, device)
 
     # Argoverse(1920 width)면 half-scale 처리
     # Scale by half if the image is from the ARGO dataset
-    if real_shape[1] == 1920 and _config['subset_argoverse']:
+    if argoverse_half_scale:
         flow_img, flow_mask = downsample_flow_and_mask(flow_img, flow_mask, 2, scale_flow=True)
         rgb = nn.functional.interpolate(rgb.unsqueeze(0), scale_factor=0.5)[0]
         depth_img_no_occlusion = downsample_depth(depth_img_no_occlusion.permute(1, 2, 0).contiguous(), 2)
@@ -231,17 +247,30 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
         # crop이 가능한 경우에만 수행하고, 작은 경우는 pad에서 처리
         if (h >= th) and (w >= tw):
             if crop_mode == 1:
-                valid_mask = (flow_mask > 0)
-                valid_ys, valid_xs = torch.where(valid_mask)
-                if valid_ys.numel() > 0:
-                    rand_idx = torch.randint(0, valid_ys.numel(), (1,))
-                    cy = valid_ys[rand_idx].item()
-                    cx = valid_xs[rand_idx].item()
+                cy = None
+                cx = None
+                if optimized_crop_path:
+                    valid_uv = torch.unique(uv_flow, dim=0)
+                    if valid_uv.numel() > 0:
+                        rand_idx = torch.randint(0, valid_uv.shape[0], (1,)).item()
+                        cy = valid_uv[rand_idx, 1].item()
+                        cx = valid_uv[rand_idx, 0].item()
+                    else:
+                        top = random.randint(0, h - th)
+                        left = random.randint(0, w - tw)
+                else:
+                    valid_mask = flow_mask > 0
+                    valid_ys, valid_xs = torch.where(valid_mask)
+                    if valid_ys.numel() > 0:
+                        rand_idx = torch.randint(0, valid_ys.numel(), (1,)).item()
+                        cy = valid_ys[rand_idx].item()
+                        cx = valid_xs[rand_idx].item()
+                    else:
+                        top = random.randint(0, h - th)
+                        left = random.randint(0, w - tw)
+                if cy is not None and cx is not None:
                     top = cy - th // 2
                     left = cx - tw // 2
-                else:
-                    top = random.randint(0, h - th)
-                    left = random.randint(0, w - tw)
             else:
                 top = random.randint(0, h - th)
                 left = random.randint(0, w - tw)
@@ -251,11 +280,24 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
 
             rgb = rgb[:, top:top + th, left:left + tw]
             depth_img_no_occlusion = depth_img_no_occlusion[:, top:top + th, left:left + tw]
-            flow_img = flow_img[top:top + th, left:left + tw, :]
-            flow_mask = flow_mask[top:top + th, left:left + tw]
+            if optimized_crop_path:
+                in_crop = (
+                    (uv_flow[:, 0] >= left) & (uv_flow[:, 0] < left + tw) &
+                    (uv_flow[:, 1] >= top) & (uv_flow[:, 1] < top + th)
+                )
+                uv_crop = uv_flow[in_crop]
+                flow_crop = flow[in_crop]
+                if uv_crop.numel() > 0:
+                    uv_crop = torch.stack((uv_crop[:, 0] - left, uv_crop[:, 1] - top), dim=1)
+                flow_img, flow_mask = _rasterize_sparse_flow((th, tw), uv_crop, flow_crop, device)
+            else:
+                flow_img = flow_img[top:top + th, left:left + tw, :]
+                flow_mask = flow_mask[top:top + th, left:left + tw]
             real_shape[0] = th
             real_shape[1] = tw
 
+    if flow_img is None or flow_mask is None:
+        flow_img, flow_mask = _rasterize_sparse_flow(real_shape[:2], uv_flow, flow, device)
 
     # pad (오른쪽/아래만)로 목표 크기 맞춤
     if img_shape is not None and (img_shape[0] >= real_shape[0] or img_shape[1] >= real_shape[1]):
@@ -1056,15 +1098,15 @@ def _run_main(gpu, _config, common_seed, world_size):
         # Cleanup
         del sample, dataset_train, dataset_val, TrainImgLoader
 
+    if rank == 0:
+        logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
+
 
 def main(gpu, _config, common_seed, world_size):
     try:
         _run_main(gpu, _config, common_seed, world_size)
     finally:
         _cleanup_distributed_run(gpu, _config['wandb'])
-
-    if rank == 0:
-        logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
 
 
 def str2bool(v):
