@@ -1,6 +1,6 @@
 python3 evaluate_flow_calibration.py \
-	    --weights /ws/data/checkpoints/cmrnext_kittiArgoversePandasetHercules_5_0.5_251110.tar \
-	    --data_folder /ws/data \
+	    --weights /ws/data/Checkpoint/debug/cmrnext_full_lidar_G4_r5_t0.5_260316_woDownsize_trainOPT_3bkv2lgy/cmrnext_HerculesLidar_5_0.5_260316_woDownsize_117_3.221.tar \
+	    --data_folder /ws/data/PublicDataset \
 	    --quantile 1.0 \
 	    --max_t 0.5 \
 	    --max_r 5 \
@@ -8,6 +8,6 @@ python3 evaluate_flow_calibration.py \
 	    --test_topic default \
 		--data_type lg_custom \
 	    --image_name image_left \
-	    --pcl_name radar_Continental \
+	    --pcl_name lidar_Aeva \
 		--fix_error False \
 		--resize_mode 2 \
