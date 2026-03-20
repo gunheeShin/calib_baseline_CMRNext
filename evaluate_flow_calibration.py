@@ -271,7 +271,8 @@ def evaluate_calibration(_config, seed):
 
         first_camera_path = os.listdir(os.path.join(val_directories[0],'sensor_data', _config['image_name']))[0]
         first_camera_frame = np.asarray(Image.open(os.path.join(val_directories[0],'sensor_data', _config['image_name'], first_camera_path)))
-        img_shape = [first_camera_frame.shape[0], first_camera_frame.shape[1]]
+        # img_shape = [first_camera_frame.shape[0], first_camera_frame.shape[1]]
+        img_shape = [536,960]
 
         if _config['downsample']:
             img_shape = [img_shape[0] // 2, img_shape[1] // 2]
@@ -518,12 +519,19 @@ def evaluate_calibration(_config, seed):
         lidar_input = torch.stack(lidar_input)
         rgb_input = torch.stack(rgb_input)
 
+        if idex == 1:
+            print(f"[VRAM] rgb_input: {rgb_input.shape}, lidar_input: {lidar_input.shape}")
+            print(f"[VRAM] Before model: allocated={torch.cuda.memory_allocated()/1e9:.3f} GB, reserved={torch.cuda.memory_reserved()/1e9:.3f} GB")
+
         for iteration in range(len(_config['weights'])):
             torch.cuda.synchronize()
             time1 = time.time()
             # Predict 'flow': dense lidar depth map to rgb pixel displacements
             with torch.no_grad():
                 predicted_flow = models[iteration](rgb_input, lidar_input)
+                if idex == 1 and iteration == 0:
+                    torch.cuda.synchronize()
+                    print(f"[VRAM] After model: allocated={torch.cuda.memory_allocated()/1e9:.3f} GB, reserved={torch.cuda.memory_reserved()/1e9:.3f} GB")
                 torch.cuda.synchronize()
                 time2 = time.time()
                 predicted_flow, predicted_uncertainty = predicted_flow
