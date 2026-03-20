@@ -1,6 +1,6 @@
 
 docker run -it --rm \
-    --gpus '"device=1,2,3"' \
+    --gpus all \
     --shm-size 64G \
     --cpus=$(nproc) \
     --ipc=host \
