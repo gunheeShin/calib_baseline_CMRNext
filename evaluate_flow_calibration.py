@@ -118,8 +118,8 @@ def downsample_and_pad(_config, rgb, depth_img_no_occlusion, img_shape, real_sha
         flow_mask = F.pad(flow_mask, shape_pad)
 
     else:
-        shape_pad[3] = (img_shape[0] - real_shape[0])  # // 2
-        shape_pad[1] = (img_shape[1] - real_shape[1])  # // 2 + 1
+        shape_pad[3] = max(0, (img_shape[0] - real_shape[0]))
+        shape_pad[1] = max(0, (img_shape[1] - real_shape[1]))
 
         rgb = F.pad(rgb, shape_pad)
         depth_img_no_occlusion = F.pad(depth_img_no_occlusion, shape_pad)
@@ -139,6 +139,76 @@ def downsample_and_pad(_config, rgb, depth_img_no_occlusion, img_shape, real_sha
         depth_img_no_occlusion = depth_img_no_occlusion * mask.unsqueeze(0)
 
     return rgb, depth_img_no_occlusion, flow_img, flow_mask
+
+
+def apply_crop(rgb, depth_img, flow_img, flow_mask, uv, flow, points_3D,
+               real_shape, img_shape, cam_params, crop_mode=-1):
+    """
+    Crop all tensors to img_shape, matching train_calibration.py's crop logic.
+    Only crops when BOTH dimensions are >= img_shape (all-or-nothing).
+    When either dimension is smaller, skip crop entirely (pad handles it later).
+    Adjusts uv coordinates and cam_params principal point for PnP.
+
+    crop_mode: -1 = center crop (deterministic, default for evaluation)
+                0 = random crop
+                1 = valid-area centered random crop
+    """
+    th, tw = img_shape
+    h, w = real_shape[:2]
+
+    # Match train_calibration.py: crop only when both dimensions are large enough
+    if not ((h >= th) and (w >= tw)):
+        return rgb, depth_img, flow_img, flow_mask, uv, flow, points_3D, cam_params, real_shape, (0, 0)
+
+    if crop_mode == -1:
+        top = (h - th) // 2
+        left = (w - tw) // 2
+    elif crop_mode == 0:
+        top = random.randint(0, h - th)
+        left = random.randint(0, w - tw)
+    elif crop_mode == 1:
+        valid_mask = flow_mask > 0
+        valid_ys, valid_xs = torch.where(valid_mask)
+        if valid_ys.numel() > 0:
+            rand_idx = torch.randint(0, valid_ys.numel(), (1,)).item()
+            cy = valid_ys[rand_idx].item()
+            cx = valid_xs[rand_idx].item()
+            top = cy - th // 2
+            left = cx - tw // 2
+        else:
+            top = (h - th) // 2
+            left = (w - tw) // 2
+    else:
+        top = (h - th) // 2
+        left = (w - tw) // 2
+
+    top = max(0, min(top, h - th))
+    left = max(0, min(left, w - tw))
+
+    # Crop image tensors
+    rgb = rgb[:, top:top + th, left:left + tw]
+    depth_img = depth_img[:, top:top + th, left:left + tw]
+    flow_img = flow_img[top:top + th, left:left + tw, :]
+    flow_mask = flow_mask[top:top + th, left:left + tw]
+
+    # Filter and adjust uv coordinates for crop offset
+    valid = (uv[:, 0] >= left) & (uv[:, 0] < left + tw) & \
+            (uv[:, 1] >= top) & (uv[:, 1] < top + th)
+    uv = uv[valid].clone()
+    uv[:, 0] -= left
+    uv[:, 1] -= top
+    flow = flow[valid]
+    points_3D = points_3D[valid]
+
+    # Adjust camera principal point for crop offset
+    cam_params = cam_params.clone()
+    cam_params[2] -= left
+    cam_params[3] -= top
+
+    real_shape[0] = th
+    real_shape[1] = tw
+
+    return rgb, depth_img, flow_img, flow_mask, uv, flow, points_3D, cam_params, real_shape, (top, left)
 
 
 def _to_numpy_image(image):
@@ -215,6 +285,13 @@ def evaluate_calibration(_config, seed):
     if 'context_encoder' in checkpoint['config']:
         _config['context_encoder'] = checkpoint['config']['context_encoder']
 
+    # Read img_shape from checkpoint config if not explicitly provided via CLI
+    if _config['img_shape'] is None and 'img_shape' in checkpoint['config']:
+        _config['img_shape'] = checkpoint['config']['img_shape']
+        print(f"Using img_shape from checkpoint: {_config['img_shape']}")
+    if 'crop_mode' not in _config:
+        _config['crop_mode'] = -1
+
     mean_torch = torch.tensor([0.485, 0.456, 0.406]).to(device)
     std_torch = torch.tensor([0.229, 0.224, 0.225]).to(device)
 
@@ -269,17 +346,20 @@ def evaluate_calibration(_config, seed):
         for subdir in subdir_list:
             val_directories.append(os.path.join(_config['data_folder'], _config['dataset'], subdir, 'offline'))
 
-        first_camera_path = os.listdir(os.path.join(val_directories[0],'sensor_data', _config['image_name']))[0]
-        first_camera_frame = np.asarray(Image.open(os.path.join(val_directories[0],'sensor_data', _config['image_name'], first_camera_path)))
-        # img_shape = [first_camera_frame.shape[0], first_camera_frame.shape[1]]
-        img_shape = [536,960]
+        if _config['img_shape'] is not None:
+            img_shape = list(_config['img_shape'])
+            print(f"Using img_shape from config/checkpoint: {img_shape}")
+        else:
+            first_camera_path = os.listdir(os.path.join(val_directories[0],'sensor_data', _config['image_name']))[0]
+            first_camera_frame = np.asarray(Image.open(os.path.join(val_directories[0],'sensor_data', _config['image_name'], first_camera_path)))
+            img_shape = [first_camera_frame.shape[0], first_camera_frame.shape[1]]
 
-        if _config['downsample']:
-            img_shape = [img_shape[0] // 2, img_shape[1] // 2]
-        if img_shape[0] % 64 > 0:
-            img_shape[0] = 64 * ((img_shape[0] // 64) + 1)
-        if img_shape[1] % 64 > 0:
-            img_shape[1] = 64 * ((img_shape[1] // 64) + 1)
+            if _config['downsample']:
+                img_shape = [img_shape[0] // 2, img_shape[1] // 2]
+            if img_shape[0] % 64 > 0:
+                img_shape[0] = 64 * ((img_shape[0] // 64) + 1)
+            if img_shape[1] % 64 > 0:
+                img_shape[1] = 64 * ((img_shape[1] // 64) + 1)
     else:
         raise RuntimeError("Dataset unknown")
 
@@ -408,9 +488,9 @@ def evaluate_calibration(_config, seed):
 
             rgb = sample['rgb'][idx].cuda()
 
-            # Normalize image
-            rgb = rgb / 255.
+            # Normalize image (match train_calibration.py: only /255 when normalize_images=True)
             if _config['normalize_images']:
+                rgb = rgb / 255.
                 rgb = (rgb - mean_torch) / std_torch
             rgb = rgb.permute(2, 0, 1)
 
@@ -509,9 +589,38 @@ def evaluate_calibration(_config, seed):
             else:
                 viz_initial_np = None
 
+            # Save pre-crop state for iterative refinement
+            pre_crop_real_shape = real_shape.copy()
+            pre_crop_cam_params = cam_params.clone()
+
+            # Crop to img_shape (matching train_calibration.py's preprocessing)
+            crop_mode = _config.get('crop_mode', -1)
+            (rgb, depth_img_no_occlusion, flow_img, flow_mask,
+             uv, flow, points_3D, cam_params, real_shape, crop_offset) = apply_crop(
+                rgb, depth_img_no_occlusion, flow_img, flow_mask,
+                uv, flow, points_3D, real_shape, img_shape, cam_params, crop_mode)
+
+            # Rebuild cam_model with cropped cam_params for PnP
+            cam_model = CameraModel()
+            cam_model.focal_length = cam_params[:2]
+            cam_model.principal_point = cam_params[2:]
+
+            # DEBUG: shapes after crop, before downsample_and_pad
+            if idex == 1:
+                print(f"[DEBUG] After crop: rgb={rgb.shape}, depth={depth_img_no_occlusion.shape}, "
+                      f"flow_img={flow_img.shape}, flow_mask={flow_mask.shape}")
+                print(f"[DEBUG] uv shape={uv.shape}, uv[:,0] range=[{uv[:,0].min()}, {uv[:,0].max()}], "
+                      f"uv[:,1] range=[{uv[:,1].min()}, {uv[:,1].max()}]")
+                print(f"[DEBUG] real_shape={real_shape}, img_shape={img_shape}")
+
             rgb, depth_img_no_occlusion, flow_img, flow_mask = downsample_and_pad(_config, rgb, depth_img_no_occlusion,
                                                                                   img_shape, real_shape, flow_img,
                                                                                   flow_mask)
+
+            # DEBUG: shapes after downsample_and_pad
+            if idex == 1:
+                print(f"[DEBUG] After pad: rgb={rgb.shape}, depth={depth_img_no_occlusion.shape}, "
+                      f"flow_img={flow_img.shape}, flow_mask={flow_mask.shape}")
 
             rgb_input.append(rgb)
             lidar_input.append(depth_img_no_occlusion)
@@ -547,6 +656,10 @@ def evaluate_calibration(_config, seed):
 
             up_flow = predicted_flow[-1]
 
+            # DEBUG: model output shape
+            if idex == 1 and iteration == 0:
+                print(f"[DEBUG] Model output: up_flow={up_flow.shape}")
+
             # EPE
             gt = flow_img.clone().permute(2, 0, 1)
             gt = torch.cat((gt, flow_mask.unsqueeze(0).float()))
@@ -554,6 +667,18 @@ def evaluate_calibration(_config, seed):
             epe[iteration].append(EndPointError(up_flow, gt).item())
 
             up_flow = up_flow[0].permute(1, 2, 0)
+
+            # DEBUG: check indexing bounds
+            if idex == 1 and iteration == 0:
+                print(f"[DEBUG] up_flow after permute: {up_flow.shape}")
+                print(f"[DEBUG] uv[:,1] max={uv[:,1].max().item()} vs up_flow dim0={up_flow.shape[0]}")
+                print(f"[DEBUG] uv[:,0] max={uv[:,0].max().item()} vs up_flow dim1={up_flow.shape[1]}")
+                print(f"[DEBUG] flow_mask shape={flow_mask.shape}")
+                oob_y = (uv[:, 1] >= up_flow.shape[0]).sum().item()
+                oob_x = (uv[:, 0] >= up_flow.shape[1]).sum().item()
+                print(f"[DEBUG] Out-of-bounds: y={oob_y}, x={oob_x}")
+                torch.cuda.synchronize()
+                print("[DEBUG] Sync OK before indexing")
 
             new_uv = uv.float() + up_flow[uv[:, 1], uv[:, 0]] # uv는 픽셀좌표
 
@@ -746,27 +871,44 @@ def evaluate_calibration(_config, seed):
                 break
 
             # Rotate point cloud based on predicted pose, and generate new
-            # inputs for the next iteration
+            # inputs for the next iteration (use pre-crop state for projection)
             rotated_point_cloud = rotate_forward(sample['point_cloud'][idx], extrinsic_error[-1])
 
-            depth_img_no_occlusion, uv, indexes, depth = prepare_input(cam_params, rotated_point_cloud, real_shape,
-                                                                       reflectance, _config)
+            iter_real_shape = pre_crop_real_shape.copy()
+            depth_img_no_occlusion, uv, indexes, depth = prepare_input(pre_crop_cam_params, rotated_point_cloud,
+                                                                       iter_real_shape, reflectance, _config)
+
+            iter_cam_model = CameraModel()
+            iter_cam_model.focal_length = pre_crop_cam_params[:2]
+            iter_cam_model.principal_point = pre_crop_cam_params[2:]
 
             flow, points_3D, new_indexes = get_flow_zforward(uv.float(), depth[indexes], extrinsic_error[-1].inverse(),
-                                                             cam_model, [real_shape[0], real_shape[1], 3],
+                                                             iter_cam_model, [iter_real_shape[0], iter_real_shape[1], 3],
                                                              scale_flow=False, reverse=False,
                                                              get_valid_indexes=True)
 
             uv = uv[new_indexes].clone()
             flow = flow[new_indexes].clone()
+            points_3D = points_3D[new_indexes].clone()
 
             rgb = sample['rgb'][idx].cuda()
-            flow_img = torch.zeros((real_shape[0], real_shape[1], 2), device='cuda', dtype=torch.float)
+            flow_img = torch.zeros((iter_real_shape[0], iter_real_shape[1], 2), device='cuda', dtype=torch.float)
             flow_img[uv[:, 1], uv[:, 0]] = flow
-            flow_mask = torch.zeros((real_shape[0], real_shape[1]), device='cuda', dtype=torch.int)
+            flow_mask = torch.zeros((iter_real_shape[0], iter_real_shape[1]), device='cuda', dtype=torch.int)
             flow_mask[uv[:, 1], uv[:, 0]] = 1
 
-            points_3D = points_3D[new_indexes].clone()
+            # Apply same crop as first iteration (center crop is deterministic)
+            (rgb, depth_img_no_occlusion, flow_img, flow_mask,
+             uv, flow, points_3D, cam_params, iter_real_shape, _) = apply_crop(
+                rgb, depth_img_no_occlusion, flow_img, flow_mask,
+                uv, flow, points_3D, iter_real_shape, img_shape, pre_crop_cam_params, crop_mode=-1)
+
+            # Rebuild cam_model with cropped cam_params for PnP
+            cam_model = CameraModel()
+            cam_model.focal_length = cam_params[:2]
+            cam_model.principal_point = cam_params[2:]
+
+            real_shape = iter_real_shape
             rgb, depth_img_no_occlusion, flow_img, flow_mask = downsample_and_pad(_config, rgb, depth_img_no_occlusion,
                                                                                   img_shape, real_shape,
                                                                                   flow_img, flow_mask)
@@ -930,7 +1072,10 @@ def main():
     parser.add_argument('--max_r', type=float, default=20.)
     parser.add_argument('--num_worker', type=int, default=2)
     parser.add_argument('--weights', type=str, nargs='+', default=None)
-    parser.add_argument('--img_shape', type=int, nargs=1, default=2)
+    parser.add_argument('--img_shape', type=int, nargs=2, default=None,
+                        help='Target image shape [H, W]. If None, read from checkpoint config.')
+    parser.add_argument('--crop_mode', type=int, default=-1,
+                        help='Crop mode: -1=center (default for eval), 0=random, 1=valid-area random')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--deterministic', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--save_file', type=str, nargs='?', default=None)

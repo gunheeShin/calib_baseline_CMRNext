@@ -7,6 +7,8 @@
     # --wandb_tags hercules,finetune,lidar,r20,t1.5 \
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+
 python3 train_calibration.py \
     --savemodel /ws/data/Checkpoint \
     --data_folder_custom /ws/data/PublicDataset \

@@ -11,3 +11,4 @@ docker run -it --rm \
     -v $(realpath .):/ws/external \
     -v /media/TrainDataset/LG_Innotek:/ws/data \
     wanheekim/cmrnext:latest
+# '"device=0"'
