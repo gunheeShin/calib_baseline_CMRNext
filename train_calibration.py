@@ -8,7 +8,6 @@ import time
 import uuid
 import re
 
-import mathutils
 import numpy as np
 import cv2
 import torch
@@ -32,7 +31,7 @@ from flow_losses import RAFT_loss2
 from utils import resize_dense_vector
 from models.get_model import get_model
 from utils import merge_inputs, rotate_back, get_flow_zforward, downsample_flow_and_mask, \
-    init_logger, downsample_depth, get_ECE
+    init_logger, downsample_depth, get_ECE, quat2mat, tvector2mat
 from flow_vis import flow_to_color
 
 torch.backends.cudnn.benchmark = True
@@ -93,34 +92,47 @@ def _generate_run_id(save_model_name: str) -> str:
     return f"{base}_{ts}_{suffix}"
 
 
+def _all_reduce_sums(metric_sums: torch.Tensor) -> torch.Tensor:
+    reduced = metric_sums.clone()
+    if dist.is_initialized():
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    return reduced
+
+
+def _rasterize_sparse_flow(shape_hw, uv_flow, flow, device):
+    flow_img = torch.zeros((shape_hw[0], shape_hw[1], 2), device=device, dtype=torch.float)
+    flow_mask = torch.zeros((shape_hw[0], shape_hw[1]), device=device, dtype=torch.int)
+    if uv_flow.numel() > 0:
+        flow_img[uv_flow[:, 1], uv_flow[:, 0]] = flow
+        flow_mask[uv_flow[:, 1], uv_flow[:, 0]] = 1
+    return flow_img, flow_mask
+
+
 def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=False):
     # 샘플 기본 정보와 포인트클라우드 준비
     real_shape = [sample['rgb'][idx].shape[0], sample['rgb'][idx].shape[1], sample['rgb'][idx].shape[2]]
-    sample['point_cloud'][idx] = sample['point_cloud'][idx].to(device)
-    pc_rotated = sample['point_cloud'][idx].clone()
+    point_cloud = sample['point_cloud'][idx].to(device, non_blocking=True)
     reflectance = None
     if _config['use_reflectance']:
-        reflectance = sample['reflectance'][idx].to(device)
+        reflectance = sample['reflectance'][idx].to(device, non_blocking=True)
 
     # RT(오차 extrinsic) 구성: rot_error/tr_error → 4×4 변환행렬
-    R = mathutils.Quaternion(sample['rot_error'][idx]).to_matrix()
-    R.resize_4x4()
-    T = mathutils.Matrix.Translation(sample['tr_error'][idx])
-    try:
-        RT = T @ R
-    except:
-        RT = T * R
+    rot_error = sample['rot_error'][idx]
+    tr_error = sample['tr_error'][idx]
+    RT = torch.mm(tvector2mat(tr_error), quat2mat(rot_error))
 
-    if not aligned:
-        pc_rotated = rotate_back(pc_rotated, RT)
+    if aligned:
+        pc_rotated = point_cloud
+    else:
+        pc_rotated = rotate_back(point_cloud, RT)
 
-    rgb = sample['rgb'][idx].to(device)
+    rgb = sample['rgb'][idx].to(device, non_blocking=True)
     if _config['normalize_images']:
         rgb = rgb / 255.
         rgb = (rgb - mean) / std
     rgb = rgb.permute(2, 0, 1)
 
-    cam_params = sample['calib'][idx].to(device)
+    cam_params = sample['calib'][idx].to(device, non_blocking=True)
 
     cam_model = CameraModel()
     cam_model.focal_length = cam_params[:2]
@@ -163,8 +175,8 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
         new_w = (real_shape[1] // 2) // 8 * 8
         scale_h = new_h / real_shape[0]
         scale_w = new_w / real_shape[1]
-        cam_model.focal_length = torch.tensor([cam_params[0] * scale_w, cam_params[1] * scale_h], device=device)
-        cam_model.principal_point = torch.tensor([cam_params[2] * scale_w, cam_params[3] * scale_h], device=device)
+        cam_model.focal_length = torch.stack((cam_params[0] * scale_w, cam_params[1] * scale_h))
+        cam_model.principal_point = torch.stack((cam_params[2] * scale_w, cam_params[3] * scale_h))
         rgb = rgb.unsqueeze(0)
         rgb = F.interpolate(rgb, size=(new_h, new_w), mode='bilinear', align_corners=True)[0]
         real_shape[0] = new_h
@@ -173,8 +185,7 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
     uv_lidar, depth, _, refl = cam_model.project_pytorch(pc_rotated, real_shape, reflectance)
     uv_lidar = uv_lidar.t().int().contiguous()
 
-    depth_img = torch.zeros(real_shape[:2], device=device, dtype=torch.float)
-    depth_img += 1000.
+    depth_img = torch.full(real_shape[:2], 1000., device=device, dtype=torch.float)
     depth_img = visibility.depth_image(uv_lidar, depth, depth_img, uv_lidar.shape[0], real_shape[1],
                                        real_shape[0])
     temp_index = (depth_img == 1000.)
@@ -201,19 +212,25 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
                                              [real_shape[0], real_shape[1], 3],
                                              scale_flow=False, reverse=False,
                                              get_valid_indexes=True)
-    uv_flow = uv_lidar
-    uv_flow = uv_flow[new_indexes].clone()
-    flow = flow[new_indexes].clone()
+    uv_flow = uv_lidar[new_indexes]
+    flow = flow[new_indexes]
+    flow_img = None
+    flow_mask = None
+    argoverse_half_scale = real_shape[1] == 1920 and _config['subset_argoverse']
+    optimized_crop_path = (
+        _config.get('data_type') == 'lg_custom'
+        and _config.get('dataset') == 'hercules'
+        and not _config['use_reflectance']
+        and img_shape is not None
+        and not argoverse_half_scale
+    )
 
-    # dense flow 이미지와 마스크로 “뿌리기”
-    flow_img = torch.zeros((real_shape[0], real_shape[1], 2), device=device, dtype=torch.float)
-    flow_img[uv_flow[:, 1], uv_flow[:, 0]] = flow
-    flow_mask = torch.zeros((real_shape[0], real_shape[1]), device=device, dtype=torch.int)
-    flow_mask[uv_flow[:, 1], uv_flow[:, 0]] = 1
+    if not optimized_crop_path:
+        flow_img, flow_mask = _rasterize_sparse_flow(real_shape[:2], uv_flow, flow, device)
 
     # Argoverse(1920 width)면 half-scale 처리
     # Scale by half if the image is from the ARGO dataset
-    if real_shape[1] == 1920 and _config['subset_argoverse']:
+    if argoverse_half_scale:
         flow_img, flow_mask = downsample_flow_and_mask(flow_img, flow_mask, 2, scale_flow=True)
         rgb = nn.functional.interpolate(rgb.unsqueeze(0), scale_factor=0.5)[0]
         depth_img_no_occlusion = downsample_depth(depth_img_no_occlusion.permute(1, 2, 0).contiguous(), 2)
@@ -230,17 +247,30 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
         # crop이 가능한 경우에만 수행하고, 작은 경우는 pad에서 처리
         if (h >= th) and (w >= tw):
             if crop_mode == 1:
-                valid_mask = (flow_mask > 0)
-                valid_ys, valid_xs = torch.where(valid_mask)
-                if valid_ys.numel() > 0:
-                    rand_idx = torch.randint(0, valid_ys.numel(), (1,))
-                    cy = valid_ys[rand_idx].item()
-                    cx = valid_xs[rand_idx].item()
+                cy = None
+                cx = None
+                if optimized_crop_path:
+                    valid_uv = torch.unique(uv_flow, dim=0)
+                    if valid_uv.numel() > 0:
+                        rand_idx = torch.randint(0, valid_uv.shape[0], (1,)).item()
+                        cy = valid_uv[rand_idx, 1].item()
+                        cx = valid_uv[rand_idx, 0].item()
+                    else:
+                        top = random.randint(0, h - th)
+                        left = random.randint(0, w - tw)
+                else:
+                    valid_mask = flow_mask > 0
+                    valid_ys, valid_xs = torch.where(valid_mask)
+                    if valid_ys.numel() > 0:
+                        rand_idx = torch.randint(0, valid_ys.numel(), (1,)).item()
+                        cy = valid_ys[rand_idx].item()
+                        cx = valid_xs[rand_idx].item()
+                    else:
+                        top = random.randint(0, h - th)
+                        left = random.randint(0, w - tw)
+                if cy is not None and cx is not None:
                     top = cy - th // 2
                     left = cx - tw // 2
-                else:
-                    top = random.randint(0, h - th)
-                    left = random.randint(0, w - tw)
             else:
                 top = random.randint(0, h - th)
                 left = random.randint(0, w - tw)
@@ -250,11 +280,24 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
 
             rgb = rgb[:, top:top + th, left:left + tw]
             depth_img_no_occlusion = depth_img_no_occlusion[:, top:top + th, left:left + tw]
-            flow_img = flow_img[top:top + th, left:left + tw, :]
-            flow_mask = flow_mask[top:top + th, left:left + tw]
+            if optimized_crop_path:
+                in_crop = (
+                    (uv_flow[:, 0] >= left) & (uv_flow[:, 0] < left + tw) &
+                    (uv_flow[:, 1] >= top) & (uv_flow[:, 1] < top + th)
+                )
+                uv_crop = uv_flow[in_crop]
+                flow_crop = flow[in_crop]
+                if uv_crop.numel() > 0:
+                    uv_crop = torch.stack((uv_crop[:, 0] - left, uv_crop[:, 1] - top), dim=1)
+                flow_img, flow_mask = _rasterize_sparse_flow((th, tw), uv_crop, flow_crop, device)
+            else:
+                flow_img = flow_img[top:top + th, left:left + tw, :]
+                flow_mask = flow_mask[top:top + th, left:left + tw]
             real_shape[0] = th
             real_shape[1] = tw
 
+    if flow_img is None or flow_mask is None:
+        flow_img, flow_mask = _rasterize_sparse_flow(real_shape[:2], uv_flow, flow, device)
 
     # pad (오른쪽/아래만)로 목표 크기 맞춤
     if img_shape is not None and (img_shape[0] >= real_shape[0] or img_shape[1] >= real_shape[1]):
@@ -272,7 +315,7 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
     # Fourier feature로 depth를 채널 확장 (옵션)
     if _config['fourier_levels'] >= 0:
         depth_img_no_occlusion = depth_img_no_occlusion.squeeze()
-        mask = (depth_img_no_occlusion > 0).clone()
+        mask = depth_img_no_occlusion > 0
         fourier_feats = []
         for L in range(_config['fourier_levels']):
             fourier_feat = depth_img_no_occlusion * np.pi * 2 ** L
@@ -287,7 +330,7 @@ def prepare_input(_config, device, idx, img_shape, mean, sample, std, aligned=Fa
 def train(model, optimizer, scaler, rgb_img, lidar_img, target_flow, target_mask, _config):
     model.train()
 
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     with amp.autocast(enabled=_config['amp']):
         # Run model
@@ -296,7 +339,7 @@ def train(model, optimizer, scaler, rgb_img, lidar_img, target_flow, target_mask
         predicted_flow, predicted_uncertainty = predicted_flow
 
         # Calculate Loss
-        flow_loss, metrics = RAFT_loss2(predicted_flow, predicted_uncertainty, target_flow[0], target_mask[0],
+        flow_loss, metrics = RAFT_loss2(predicted_flow, predicted_uncertainty, target_flow, target_mask,
                                         upsample=False,
                                         weight_nll=_config['weight_nll'], unc_type=_config['der_type'])
 
@@ -329,21 +372,21 @@ def test(model, rgb_img, lidar_img, target_flow, target_mask, log_image, _config
     predicted_flow, predicted_uncertainty = predicted_flow
 
     # Calculate Loss
-    flow_loss, metrics = RAFT_loss2(predicted_flow, predicted_uncertainty, target_flow[0], target_mask[0],
+    flow_loss, metrics = RAFT_loss2(predicted_flow, predicted_uncertainty, target_flow, target_mask,
                                     upsample=False,
                                     weight_nll=_config['weight_nll'], unc_type=_config['der_type'])
 
     total_loss = flow_loss
 
     #  EPE
-    gt = torch.cat((target_flow[0], target_mask[0][:, 0:1, :, :]), dim=1)
+    gt = torch.cat((target_flow, target_mask[:, 0:1, :, :]), dim=1)
     epe = metrics['epe']
     f1 = metrics['f1']
 
     # Expected Calibration Error (Uncertainty Estimation)
     ece_dict, ece_u, ece_v = None, None, None
     if _config['uncertainty']:
-        ece_u, ece_v = get_ECE(predicted_flow[-1], predicted_uncertainty[-1], target_flow[0], target_mask[0],
+        ece_u, ece_v = get_ECE(predicted_flow[-1], predicted_uncertainty[-1], target_flow, target_mask,
                                loss_type=_config['der_type'])
 
     # Log images in Weights&Biases
@@ -389,7 +432,21 @@ def test(model, rgb_img, lidar_img, target_flow, target_mask, log_image, _config
     return total_loss.detach(), epe.detach(), ece_u, ece_v, ece_dict, f1
 
 
-def main(gpu, _config, common_seed, world_size):
+def _cleanup_distributed_run(rank, use_wandb):
+    if use_wandb and rank == 0 and wandb.run is not None:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+
+    if dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+
+def _run_main(gpu, _config, common_seed, world_size):
     global EPOCH
     rank = gpu
 
@@ -632,7 +689,7 @@ def main(gpu, _config, common_seed, world_size):
             for subdir in ['parking_lot_2']:
                 test_directories_custom.append(os.path.join(os.path.join(_config['data_folder_custom'], subdir), 'CMRNext'))
 
-            dataset_val_custom = DatasetGeneralExtrinsicCalib(test_directories_custom, train=True, max_r=_config['max_r'],
+            dataset_val_custom = DatasetGeneralExtrinsicCalib(test_directories_custom, train=False, max_r=_config['max_r'],
                                                           max_t=_config['max_t'],
                                                           use_reflectance=_config['use_reflectance'],
                                                           normalize_images=_config['normalize_images'],
@@ -652,7 +709,7 @@ def main(gpu, _config, common_seed, world_size):
             for subdir in subdir_list:
                 test_directories_lg_custom.append(os.path.join(_config['data_folder_custom'], _config['dataset'], subdir, 'offline'))
 
-            dataset_val_lg_custom = DatasetGeneralExtrinsicCalib(test_directories_lg_custom, train=True, max_r=_config['max_r'],
+            dataset_val_lg_custom = DatasetGeneralExtrinsicCalib(test_directories_lg_custom, train=False, max_r=_config['max_r'],
                                                           max_t=_config['max_t'],
                                                           use_reflectance=_config['use_reflectance'],
                                                           normalize_images=_config['normalize_images'],
@@ -746,10 +803,8 @@ def main(gpu, _config, common_seed, world_size):
 
         EPOCH = epoch
         epoch_start_time = time.time()
-        total_train_loss = 0
-        local_loss = 0.
-        local_epe = 0.
-        total_train_epe = 0.
+        train_window_metrics = torch.zeros(3, device=device)
+        train_epoch_metrics = torch.zeros(3, device=device)
         if epoch != starting_epoch:
             if _config['wandb'] and rank == 0:
                 wandb.log({'LR': scheduler.get_last_lr()[0]}, commit=False)
@@ -761,22 +816,11 @@ def main(gpu, _config, common_seed, world_size):
             start_time = time.time()
             lidar_input = []
             rgb_input = []
+            target_flow = []
+            target_mask = []
 
-            target_flow1 = []
-            target_flow2 = []
-            target_flow3 = []
-            target_flow4 = []
-            target_flow5 = []
-            target_flow6 = []
-            target_mask1 = []
-            target_mask2 = []
-            target_mask3 = []
-            target_mask4 = []
-            target_mask5 = []
-            target_mask6 = []
-
-            sample['tr_error'] = sample['tr_error'].to(device)
-            sample['rot_error'] = sample['rot_error'].to(device)
+            sample['tr_error'] = sample['tr_error'].to(device, non_blocking=True)
+            sample['rot_error'] = sample['rot_error'].to(device, non_blocking=True)
 
             for idx in range(len(sample['rgb'])):
                 # ProjectPointCloud in RT-pose
@@ -790,25 +834,8 @@ def main(gpu, _config, common_seed, world_size):
                 flow_mask = flow_mask.contiguous()
                 rgb_input.append(rgb)
                 lidar_input.append(depth_img_no_occlusion)
-                target_flow1.append(flow_img.permute(2, 0, 1).clone())
-                target_mask1.append(flow_mask.repeat(2, 1, 1).float().clone())
-
-                down_flow2, down_mask2 = downsample_flow_and_mask(flow_img, flow_mask, 4)
-                down_flow3, down_mask3 = downsample_flow_and_mask(down_flow2, down_mask2, 2)
-                down_flow4, down_mask4 = downsample_flow_and_mask(down_flow3, down_mask3, 2)
-                down_flow5, down_mask5 = downsample_flow_and_mask(down_flow4, down_mask4, 2)
-                down_flow6, down_mask6 = downsample_flow_and_mask(down_flow5, down_mask5, 2)
-
-                target_flow2.append(down_flow2.permute(2, 0, 1).clone())
-                target_mask2.append(down_mask2.repeat(2, 1, 1).float().clone())
-                target_flow3.append(down_flow3.permute(2, 0, 1).clone())
-                target_mask3.append(down_mask3.repeat(2, 1, 1).float().clone())
-                target_flow4.append(down_flow4.permute(2, 0, 1).clone())
-                target_mask4.append(down_mask4.repeat(2, 1, 1).float().clone())
-                target_flow5.append(down_flow5.permute(2, 0, 1).clone())
-                target_mask5.append(down_mask5.repeat(2, 1, 1).float().clone())
-                target_flow6.append(down_flow6.permute(2, 0, 1).clone())
-                target_mask6.append(down_mask6.repeat(2, 1, 1).float().clone())
+                target_flow.append(flow_img.permute(2, 0, 1))
+                target_mask.append(flow_mask.repeat(2, 1, 1).float())
 
                 if _config['debug']:
                     def _depth_overlay(depth_tensor, base_rgb):
@@ -883,96 +910,70 @@ def main(gpu, _config, common_seed, world_size):
 
             lidar_input = torch.stack(lidar_input)
             rgb_input = torch.stack(rgb_input)
-            target_flow1 = torch.stack(target_flow1)
-            target_flow2 = torch.stack(target_flow2)
-            target_flow3 = torch.stack(target_flow3)
-            target_flow4 = torch.stack(target_flow4)
-            target_flow5 = torch.stack(target_flow5)
-            target_flow6 = torch.stack(target_flow6)
-            target_mask1 = torch.stack(target_mask1)
-            target_mask2 = torch.stack(target_mask2)
-            target_mask3 = torch.stack(target_mask3)
-            target_mask4 = torch.stack(target_mask4)
-            target_mask5 = torch.stack(target_mask5)
-            target_mask6 = torch.stack(target_mask6)
+            target_flow = torch.stack(target_flow)
+            target_mask = torch.stack(target_mask)
 
-            loss, epe = train(model, optimizer, scaler, rgb_input, lidar_input,
-                              [target_flow1, target_flow2, target_flow3, target_flow4, target_flow5, target_flow6],
-                              [target_mask1, target_mask2, target_mask3, target_mask4, target_mask5, target_mask6],
-                              _config)
+            loss, epe = train(model, optimizer, scaler, rgb_input, lidar_input, target_flow, target_mask, _config)
 
-            dist.barrier()
-            dist.reduce(loss, 0)
-            dist.reduce(epe, 0)
+            batch_metrics = torch.stack((loss, epe, loss.new_tensor(1.0)))
+            train_window_metrics += batch_metrics
+            train_epoch_metrics += batch_metrics
             if _config['scheduler'].startswith('cycle'):
                 scheduler.step()
-            if rank == 0:
-                loss = loss / world_size
-                epe = epe / world_size
-                local_loss += loss.item()
-                local_epe += epe.item()
 
-                if batch_idx % _config['print_every'] == 0 and batch_idx != 0:
+            if batch_idx % _config['print_every'] == 0 and batch_idx != 0:
+                reduced_window = _all_reduce_sums(train_window_metrics)
+                if rank == 0:
+                    window_count = max(reduced_window[2].item(), 1.0)
+                    avg_loss = reduced_window[0].item() / window_count
+                    avg_epe = reduced_window[1].item() / window_count
                     logger.info('Iter %d/%d training loss = %.3f , epe = %.3f, time = %.2f, time for %d it = %.2f' %
                                 (batch_idx,
                                  len(TrainImgLoader),
-                                 local_loss / _config['print_every'],
-                                 local_epe / _config['print_every'],
+                                 avg_loss,
+                                 avg_epe,
                                  (time.time() - start_time) / lidar_input.shape[0],
                                  _config['print_every'],
                                  (time.time() - time_for_N_it)))
                     time_for_N_it = time.time()
                     if _config['wandb']:
-                        wandb.log({'Loss': local_loss / _config['print_every']}, step=total_iter)
-                        wandb.log({'EPE': local_epe / _config['print_every']}, step=total_iter)
-                    local_loss = 0.
-                    local_epe = 0.
-                total_train_loss += loss.item()
-                total_train_epe += epe.item()
+                        wandb.log({'Loss': avg_loss}, step=total_iter)
+                        wandb.log({'EPE': avg_epe}, step=total_iter)
+                train_window_metrics.zero_()
+
+            if rank == 0:
                 total_iter += len(sample['rgb']) * world_size
             del loss, epe
-            del target_mask1, target_mask2, target_mask3, target_mask4, target_mask5, target_mask6
-            del target_flow1, target_flow2, target_flow3, target_flow4, target_flow5, target_flow6
+            del target_mask, target_flow
             del rgb_input, lidar_input
 
+        reduced_train_epoch = _all_reduce_sums(train_epoch_metrics)
+        train_epoch_count = max(reduced_train_epoch[2].item(), 1.0)
+        total_train_loss = reduced_train_epoch[0].item() / train_epoch_count
+        total_train_epe = reduced_train_epoch[1].item() / train_epoch_count
         if rank == 0:
             logger.info("------------------------------------")
             logger.info('epoch %d total training loss = %.3f, total training epe = %.3f' %
-                        (epoch, total_train_loss / batch_idx, total_train_epe / batch_idx))
+                        (epoch, total_train_loss, total_train_epe))
             logger.info('Total epoch time = %.2f' % (time.time() - epoch_start_time))
             logger.info("------------------------------------")
             if _config['wandb']:
-                wandb.log({'Total training loss': total_train_loss / batch_idx, 'epoch': epoch}, commit=False)
-                wandb.log({'Total training EPE': total_train_epe / batch_idx}, commit=False)
+                wandb.log({'Total training loss': total_train_loss, 'epoch': epoch}, commit=False)
+                wandb.log({'Total training EPE': total_train_epe}, commit=False)
 
         ## Test ##
-        total_test_loss = 0.
-        total_test_epe = 0.
-        total_test_f1 = 0.
-        total_test_ece_u = 0.
-        total_test_ece_v = 0.
-
-        local_loss = 0.0
+        val_window_metrics = torch.zeros(2, device=device)
+        val_epoch_metrics = torch.zeros(6, device=device)
+        has_f1 = False
         for batch_idx, sample in enumerate(TestImgLoader):
             start_time = time.time()
             lidar_input = []
             rgb_input = []
+            target_flow = []
+            target_mask = []
 
-            target_flow1 = []
-            target_flow2 = []
-            target_flow3 = []
-            target_flow4 = []
-            target_flow5 = []
-            target_flow6 = []
-            target_mask1 = []
-            target_mask2 = []
-            target_mask3 = []
-            target_mask4 = []
-            target_mask5 = []
-            target_mask6 = []
-
-            sample['tr_error'] = sample['tr_error'].to(device)
-            sample['rot_error'] = sample['rot_error'].to(device)
+            sample['tr_error'] = sample['tr_error'].to(device, non_blocking=True)
+            sample['rot_error'] = sample['rot_error'].to(device, non_blocking=True)
 
             for idx in range(len(sample['rgb'])):
                 # ProjectPointCloud in RT-pose
@@ -985,104 +986,70 @@ def main(gpu, _config, common_seed, world_size):
                 rgb_input.append(rgb)
                 lidar_input.append(depth_img_no_occlusion)
 
-                target_flow1.append(flow_img.permute(2, 0, 1).clone())
-                target_mask1.append(flow_mask.repeat(2, 1, 1).float().clone())
-
-                down_flow2, down_mask2 = downsample_flow_and_mask(flow_img, flow_mask, 4)
-                down_flow3, down_mask3 = downsample_flow_and_mask(down_flow2, down_mask2, 2)
-                down_flow4, down_mask4 = downsample_flow_and_mask(down_flow3, down_mask3, 2)
-                down_flow5, down_mask5 = downsample_flow_and_mask(down_flow4, down_mask4, 2)
-                down_flow6, down_mask6 = downsample_flow_and_mask(down_flow5, down_mask5, 2)
-
-                target_flow2.append(down_flow2.permute(2, 0, 1).clone())
-                target_mask2.append(down_mask2.repeat(2, 1, 1).float().clone())
-                target_flow3.append(down_flow3.permute(2, 0, 1).clone())
-                target_mask3.append(down_mask3.repeat(2, 1, 1).float().clone())
-                target_flow4.append(down_flow4.permute(2, 0, 1).clone())
-                target_mask4.append(down_mask4.repeat(2, 1, 1).float().clone())
-                target_flow5.append(down_flow5.permute(2, 0, 1).clone())
-                target_mask5.append(down_mask5.repeat(2, 1, 1).float().clone())
-                target_flow6.append(down_flow6.permute(2, 0, 1).clone())
-                target_mask6.append(down_mask6.repeat(2, 1, 1).float().clone())
+                target_flow.append(flow_img.permute(2, 0, 1))
+                target_mask.append(flow_mask.repeat(2, 1, 1).float())
 
             lidar_input = torch.stack(lidar_input)
             rgb_input = torch.stack(rgb_input)
-            target_flow1 = torch.stack(target_flow1)
-            target_flow2 = torch.stack(target_flow2)
-            target_flow3 = torch.stack(target_flow3)
-            target_flow4 = torch.stack(target_flow4)
-            target_flow5 = torch.stack(target_flow5)
-            target_flow6 = torch.stack(target_flow6)
-            target_mask1 = torch.stack(target_mask1)
-            target_mask2 = torch.stack(target_mask2)
-            target_mask3 = torch.stack(target_mask3)
-            target_mask4 = torch.stack(target_mask4)
-            target_mask5 = torch.stack(target_mask5)
-            target_mask6 = torch.stack(target_mask6)
+            target_flow = torch.stack(target_flow)
+            target_mask = torch.stack(target_mask)
 
-            save_images = (batch_idx == 0) and _config['wandb'] and rank == 0
+            save_images = (batch_idx == 0) and _config['wandb'] and _config['wandb_log_examples'] and rank == 0
 
-            loss, epe, ece_u, ece_v, ece_dict, f1 = test(model, rgb_input, lidar_input,
-                                                         [target_flow1, target_flow2, target_flow3, target_flow4,
-                                                          target_flow5, target_flow6],
-                                                         [target_mask1, target_mask2, target_mask3, target_mask4,
-                                                          target_mask5, target_mask6],
-                                                         save_images, _config)
-            dist.barrier()
-            dist.reduce(loss, 0)
-            dist.reduce(epe, 0)
-            if f1 is not None:
-                dist.reduce(f1, 0)
-            if _config['uncertainty']:
-                dist.reduce(ece_u, 0)
-                dist.reduce(ece_v, 0)
-            if rank == 0:
-                loss = loss / world_size
-                epe = epe / world_size
-                if f1 is not None:
-                    f1 = f1 / world_size
-                if _config['uncertainty']:
-                    ece_u = ece_u / world_size
-                    ece_v = ece_v / world_size
-                local_loss += loss.item()
+            loss, epe, ece_u, ece_v, ece_dict, f1 = test(
+                model, rgb_input, lidar_input, target_flow, target_mask, save_images, _config)
+            has_f1 = f1 is not None
 
-                if batch_idx % 50 == 0 and batch_idx != 0:
+            batch_val_window = torch.stack((loss, loss.new_tensor(1.0)))
+            val_window_metrics += batch_val_window
+            batch_val_epoch = torch.stack((
+                loss,
+                epe,
+                f1 if f1 is not None else loss.new_zeros(()),
+                ece_u if ece_u is not None else loss.new_zeros(()),
+                ece_v if ece_v is not None else loss.new_zeros(()),
+                loss.new_tensor(1.0),
+            ))
+            val_epoch_metrics += batch_val_epoch
+
+            if batch_idx % 50 == 0 and batch_idx != 0:
+                reduced_val_window = _all_reduce_sums(val_window_metrics)
+                if rank == 0:
+                    window_count = max(reduced_val_window[1].item(), 1.0)
+                    avg_val_loss = reduced_val_window[0].item() / window_count
                     logger.info('Iter %d test loss = %.3f , time = %.2f' %
-                                (batch_idx, local_loss / 50,
+                                (batch_idx, avg_val_loss,
                                  (time.time() - start_time) / lidar_input.shape[0]))
-                    local_loss = 0.0
-                total_test_loss += loss.item()
-                total_test_epe += epe.item()
-                if f1 is not None:
-                    total_test_f1 += f1.item()
-                if _config['uncertainty']:
-                    total_test_ece_u += ece_u.item()
-                    total_test_ece_v += ece_v.item()
+                val_window_metrics.zero_()
             del loss, epe
-            del target_mask1, target_mask2, target_mask3, target_mask4, target_mask5, target_mask6
-            del target_flow1, target_flow2, target_flow3, target_flow4, target_flow5, target_flow6
+            del target_mask, target_flow
             del rgb_input, flow_img, flow_mask, rgb, lidar_input
-            del down_flow2, down_flow3, down_flow4, down_flow5, down_flow6
-            del down_mask2, down_mask3, down_mask4, down_mask5, down_mask6
             del depth_img_no_occlusion
 
+        reduced_val_epoch = _all_reduce_sums(val_epoch_metrics)
+        val_epoch_count = max(reduced_val_epoch[5].item(), 1.0)
+        total_test_loss = reduced_val_epoch[0].item() / val_epoch_count
+        total_test_epe = reduced_val_epoch[1].item() / val_epoch_count
+        total_test_f1 = reduced_val_epoch[2].item() / val_epoch_count
+        total_test_ece_u = reduced_val_epoch[3].item() / val_epoch_count
+        total_test_ece_v = reduced_val_epoch[4].item() / val_epoch_count
         if rank == 0:
             logger.info("------------------------------------")
-            logger.info('total test loss = %.3f' % (total_test_loss / batch_idx))
-            logger.info('total test epe = %.3f' % (total_test_epe / batch_idx))
+            logger.info('total test loss = %.3f' % total_test_loss)
+            logger.info('total test epe = %.3f' % total_test_epe)
             logger.info("------------------------------------")
 
             if _config['wandb']:
-                wandb.log({'Val Loss': total_test_loss / batch_idx,
-                           'Val EPE': total_test_epe / batch_idx}, commit=False)
-                if f1 is not None:
-                    wandb.log({'Val F1': total_test_f1 / batch_idx}, commit=False)
+                wandb.log({'Val Loss': total_test_loss,
+                           'Val EPE': total_test_epe}, commit=False)
+                if has_f1:
+                    wandb.log({'Val F1': total_test_f1}, commit=False)
                 if _config['uncertainty']:
-                    wandb.log({'ECE u': total_test_ece_u / batch_idx,
-                               'ECE v': total_test_ece_v / batch_idx}, commit=False)
+                    wandb.log({'ECE u': total_test_ece_u,
+                               'ECE v': total_test_ece_v}, commit=False)
 
         # SAVE
-        val_epe = total_test_epe / batch_idx
+        val_epe = total_test_epe
         if rank == 0 and _config['wandb']:
             wandb.save(f'/tmp/{run_dir}.log')
             torch.save({
@@ -1090,10 +1057,10 @@ def main(gpu, _config, common_seed, world_size):
                 'epoch': epoch,
                 'state_dict': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'train_loss': total_train_loss / len(dataset_val),
-                'test_loss': total_test_loss / len(dataset_val),
-                'train_epe': total_train_epe / len(dataset_val),
-                'test_epe': total_test_epe / len(dataset_val),
+                'train_loss': total_train_loss,
+                'test_loss': total_test_loss,
+                'train_epe': total_train_epe,
+                'test_epe': total_test_epe,
             }, f'{_config["savemodel"]}/last_iter_checkpoint.tar')
         if val_epe < BEST_VAL_EPE and rank == 0:
             BEST_VAL_EPE = val_epe
@@ -1104,10 +1071,10 @@ def main(gpu, _config, common_seed, world_size):
                 'epoch': epoch,
                 'state_dict': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'train_loss': total_train_loss / len(dataset_val),
-                'test_loss': total_test_loss / len(dataset_val),
-                'train_epe': total_train_epe / len(dataset_val),
-                'test_epe': total_test_epe / len(dataset_val),
+                'train_loss': total_train_loss,
+                'test_loss': total_test_loss,
+                'train_epe': total_train_epe,
+                'test_epe': total_test_epe,
             }, savefilename)
             logger.info(f'Model saved as {savefilename}')
             if _config['wandb']:
@@ -1117,10 +1084,10 @@ def main(gpu, _config, common_seed, world_size):
                     'epoch': epoch,
                     'state_dict': model.module.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'train_loss': total_train_loss / len(dataset_val),
-                    'test_loss': total_test_loss / len(dataset_val),
-                    'train_epe': total_train_epe / len(dataset_val),
-                    'test_epe': total_test_epe / len(dataset_val),
+                    'train_loss': total_train_loss,
+                    'test_loss': total_test_loss,
+                    'train_epe': total_train_epe,
+                    'test_epe': total_test_epe,
                 }, './best_model_so_far.tar')
                 wandb.save('./best_model_so_far.tar')
             if old_save_filename is not None:
@@ -1133,6 +1100,13 @@ def main(gpu, _config, common_seed, world_size):
 
     if rank == 0:
         logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))
+
+
+def main(gpu, _config, common_seed, world_size):
+    try:
+        _run_main(gpu, _config, common_seed, world_size)
+    finally:
+        _cleanup_distributed_run(gpu, _config['wandb'])
 
 
 def str2bool(v):
@@ -1178,6 +1152,7 @@ def real_main():
     parser.add_argument('--wandb_name', type=str, default=None)
     parser.add_argument('--wandb_tags', type=str, default=None,
                         help='Comma-separated tags, e.g. "hercules,finetune,radar"')
+    parser.add_argument('--wandb_log_examples', type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument('--run_id', type=str, default=None,
                         help='Run identifier for checkpoint/log directories when wandb is disabled (or as fallback).')
     parser.add_argument('--not_normalize_images', type=str2bool, nargs='?', const=True, default=False)
@@ -1236,10 +1211,14 @@ def real_main():
     if args.master_port is not None:
         _config['MASTER_PORT'] = args.master_port
     os.environ['MASTER_PORT'] = _config['MASTER_PORT']
-    if _config['gpu'] == -1:
-        mp.spawn(main, nprocs=world_size, args=(_config, _config['seed'], world_size,))
-    else:
-        main(_config['gpu'], _config, _config['seed'], world_size)
+    try:
+        if _config['gpu'] == -1:
+            mp.spawn(main, nprocs=world_size, args=(_config, _config['seed'], world_size,))
+        else:
+            main(_config['gpu'], _config, _config['seed'], world_size)
+    except KeyboardInterrupt:
+        print("Training interrupted, shutting down distributed workers.")
+        raise SystemExit(130)
 
 
 if __name__ == '__main__':

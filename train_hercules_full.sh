@@ -5,6 +5,9 @@
     # --wandb_group hercules_finetune \
     # --wandb_name cmrnext_ft_lidar_G2_r20_t1.5_260201 \
     # --wandb_tags hercules,finetune,lidar,r20,t1.5 \
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 python3 train_calibration.py \
     --savemodel /ws/data/Checkpoint \
@@ -17,14 +20,14 @@ python3 train_calibration.py \
     --crop_mode 1 \
     --resize_mode 2  \
     --save_dir /ws/output  \
-    --save_model_name cmrnext_HerculesRadar_5_0.5_260202_woDownsize \
+    --save_model_name cmrnext_HerculesLidar_5_0.5_260316_woDownsize \
     --dataset hercules  \
     --data_type lg_custom \
     --image_name image_left \
-    --pcl_name radar_Continental \
+    --pcl_name lidar_Aeva \
     --wandb \
     --wandb_project cmrnext-calib \
     --wandb_entity LGIT_calib \
     --wandb_group hercules_fulltrain \
-    --wandb_name cmrnext_full_radar_G2_r5_t0.5_260202 \
-    --wandb_tags hercules,fulltrain,radar,r5,t0.5 \
+    --wandb_name cmrnext_full_lidar_G4_r5_t0.5_260316_woDownsize_trainOPT \
+    --wandb_tags hercules,fulltrain,lidar,r5,t0.5 \
