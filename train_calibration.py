@@ -586,6 +586,7 @@ def _run_main(gpu, _config, common_seed, world_size):
     # total_iter = starting_epoch * len(dataset)
     total_iter = 0
     dataset_custom = None
+    train_steps_per_epoch = None
     for epoch in range(starting_epoch, _config['epochs']):
 
         if _config['custom']:
@@ -782,24 +783,28 @@ def _run_main(gpu, _config, common_seed, world_size):
             logger.info(f'Len Test: {len(TestImgLoader)}')
             logger.info(f'This is {epoch}-th epoch')
 
+        current_train_steps = len(TrainImgLoader)
 
         if epoch == starting_epoch:
+            train_steps_per_epoch = current_train_steps
             if starting_epoch == 0:
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
                                                                 epochs=_config['epochs'],
-                                                                steps_per_epoch=len(dataset_train) // (
-                                                                        batch_size * world_size),
+                                                                steps_per_epoch=train_steps_per_epoch,
                                                                 pct_start=0.4, div_factor=10,
                                                                 final_div_factor=100000)
             else:
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, _config['BASE_LEARNING_RATE'],
                                                                 epochs=_config['epochs'] + 1,
-                                                                steps_per_epoch=len(dataset_train) // (
-                                                                        batch_size * world_size),
+                                                                steps_per_epoch=train_steps_per_epoch,
                                                                 pct_start=0.4, div_factor=10,
-                                                                final_div_factor=100000, last_epoch=starting_epoch * (
-                            len(dataset_train) // (batch_size * world_size)))
+                                                                final_div_factor=100000,
+                                                                last_epoch=starting_epoch * train_steps_per_epoch)
             total_iter = starting_epoch * len(dataset_train)
+        elif train_steps_per_epoch != current_train_steps and rank == 0:
+            logger.warning("Train loader length changed from %d to %d after scheduler initialization. "
+                           "OneCycleLR expects a fixed number of steps per epoch.",
+                           train_steps_per_epoch, current_train_steps)
 
         EPOCH = epoch
         epoch_start_time = time.time()
