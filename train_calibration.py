@@ -618,7 +618,8 @@ def _run_main(gpu, _config, common_seed, world_size):
                                                          max_t=_config['max_t'],
                                                          use_reflectance=_config['use_reflectance'],
                                                          normalize_images=_config['normalize_images'],
-                                                         dataset=_config['dataset'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], data_type=_config['data_type'])
+                                                         dataset=_config['dataset'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], data_type=_config['data_type'],
+                                                         z_filter_min=_config.get('z_filter_min'), z_filter_max=_config.get('z_filter_max'))
             dataset_train = dataset_lg_custom
 
         else:
@@ -966,6 +967,19 @@ def _run_main(gpu, _config, common_seed, world_size):
                 wandb.log({'Total training loss': total_train_loss, 'epoch': epoch}, commit=False)
                 wandb.log({'Total training EPE': total_train_epe}, commit=False)
 
+            # Z-filter statistics
+            if hasattr(dataset_train, 'get_z_filter_stats'):
+                z_stats = dataset_train.get_z_filter_stats()
+                if z_stats['total_points'] > 0:
+                    pct = 100.0 * z_stats['filtered_points'] / z_stats['total_points']
+                    logger.info(f"Z-filter: removed {z_stats['filtered_points']}/{z_stats['total_points']} points ({pct:.2f}%)")
+                    if _config['wandb']:
+                        wandb.log({
+                            'z_filter/filtered_pct': pct,
+                            'z_filter/total_points': z_stats['total_points'],
+                            'z_filter/filtered_points': z_stats['filtered_points'],
+                        }, commit=False)
+
         ## Test ##
         val_window_metrics = torch.zeros(2, device=device)
         val_epoch_metrics = torch.zeros(6, device=device)
@@ -1187,6 +1201,10 @@ def real_main():
     parser.add_argument('--data_type', type=str, default='default')
     parser.add_argument('--image_name', type=str, default='image_left')
     parser.add_argument('--pcl_name', type=str, default='velodyne_left')
+    parser.add_argument('--z_filter_min', type=float, default=None,
+                        help='Training-only: remove points with z < this value (sensor frame)')
+    parser.add_argument('--z_filter_max', type=float, default=None,
+                        help='Training-only: remove points with z > this value (sensor frame)')
 
     args = parser.parse_args()
     # print(args)

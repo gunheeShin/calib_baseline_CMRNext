@@ -218,7 +218,8 @@ def get_extrinsic_pandaset(camera):
 class DatasetGeneralExtrinsicCalib(Dataset):
 
     def __init__(self, dataset_dirs, transform=None, augmentation=False, use_reflectance=False, max_t=2., max_r=10.,
-                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False,data_type='default', image_name='image_left', pcl_name='lidar', downsample=False, fix_error =False, error_file=None, error_idx=0):
+                 train=True, normalize_images=True, dataset='kitti', cam='2', change_frame=False,data_type='default', image_name='image_left', pcl_name='lidar', downsample=False, fix_error =False, error_file=None, error_idx=0,
+                 z_filter_min=None, z_filter_max=None):
         super(DatasetGeneralExtrinsicCalib, self).__init__()
         self.dataset = dataset
         self.data_type = data_type
@@ -230,6 +231,10 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         self.root_dirs = dataset_dirs
         self.transform = transform
         self.train = train
+        self.z_filter_min = z_filter_min
+        self.z_filter_max = z_filter_max
+        self._z_filter_total = 0
+        self._z_filter_removed = 0
         self.normalize_images = normalize_images
         self.maps_folder = None
         self.extension = None
@@ -401,6 +406,13 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             return len(self.synced_stamps)
         return len(self.all_files)
 
+    def get_z_filter_stats(self):
+        """Return z-filter statistics and reset counters."""
+        stats = {'total_points': self._z_filter_total, 'filtered_points': self._z_filter_removed}
+        self._z_filter_total = 0
+        self._z_filter_removed = 0
+        return stats
+
     def __getitem__(self, idx):
         if self.dataset == 'kitti' or self.dataset == 'custom':
             img_path = self.all_files[idx]
@@ -460,6 +472,30 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             pc = self.point_cloud_reader(pc_path)
             cam2vel = self.initial_extrinsic
             calib = self.camera_intrinsics.clone()
+
+            if pc.shape[0] == 0 or pc.shape[1] < 3:
+                print(f"[WARNING] Empty or invalid point cloud at {pc_path}, resampling")
+                new_idx = np.random.randint(0, self.__len__())
+                return self.__getitem__(new_idx)
+
+            # Z-axis ghost point filtering (training only)
+            if self.train and (self.z_filter_min is not None or self.z_filter_max is not None):
+                n_before = pc.shape[0]
+                valid_mask = np.ones(n_before, dtype=bool)
+                if self.z_filter_min is not None:
+                    valid_mask &= (pc[:, 2] >= self.z_filter_min)
+                if self.z_filter_max is not None:
+                    valid_mask &= (pc[:, 2] <= self.z_filter_max)
+
+                n_filtered = n_before - np.sum(valid_mask)
+                self._z_filter_total += n_before
+                self._z_filter_removed += n_filtered
+
+                if not np.any(valid_mask):
+                    print(f"[WARNING] Z-filter removed ALL {n_before} points for {pc_path}, resampling")
+                    new_idx = np.random.randint(0, self.__len__())
+                    return self.__getitem__(new_idx)
+                pc = pc[valid_mask]
 
             if pc.shape[1] == 3:
                 pc = np.concatenate((pc, np.ones((pc.shape[0], 1))), 1)
