@@ -23,7 +23,10 @@ from torch import nn
 from tqdm import tqdm
 import yaml
 
-from datasets.DatasetExtrinsicCalib import DatasetGeneralExtrinsicCalib, DatasetPandasetExtrinsicCalib
+from datasets.DatasetExtrinsicCalib import (
+    DatasetGeneralExtrinsicCalib,
+    DatasetPandasetExtrinsicCalib,
+)
 from camera_model import CameraModel
 
 from models.get_model import get_model
@@ -337,12 +340,12 @@ def evaluate_calibration(_config, seed):
         if img_shape[1] % 64 > 0:
             img_shape[1] = 64 * ((img_shape[1] // 64) + 1)
     elif _config['data_type'] == 'lg_custom':
-        
         if _config['dataset'] == 'hercules':
             subdir_list = ['parking_lot_1', 'parking_lot_2', 'parking_lot_4', 'library_3']
         elif _config['dataset'] == 'lg_innotek':
-            subdir_list = ['001']
-        
+            subdir_list = ['morning_campus_2']
+        else:
+            raise RuntimeError(f"Unsupported lg_custom dataset: {_config['dataset']}")
         for subdir in subdir_list:
             val_directories.append(os.path.join(_config['data_folder'], _config['dataset'], subdir, 'offline'))
 
@@ -350,8 +353,12 @@ def evaluate_calibration(_config, seed):
             img_shape = list(_config['img_shape'])
             print(f"Using img_shape from config/checkpoint: {img_shape}")
         else:
-            first_camera_path = os.listdir(os.path.join(val_directories[0],'sensor_data', _config['image_name']))[0]
-            first_camera_frame = np.asarray(Image.open(os.path.join(val_directories[0],'sensor_data', _config['image_name'], first_camera_path)))
+            sensor_root = os.path.join(val_directories[0], 'sensor_data')
+            image_folder = _config['image_name']
+            if not os.path.isdir(os.path.join(sensor_root, image_folder)) and os.path.isdir(os.path.join(sensor_root, 'image_Cam0')):
+                image_folder = 'image_Cam0'
+            first_camera_path = os.listdir(os.path.join(sensor_root, image_folder))[0]
+            first_camera_frame = np.asarray(Image.open(os.path.join(sensor_root, image_folder, first_camera_path)))
             img_shape = [first_camera_frame.shape[0], first_camera_frame.shape[1]]
 
             if _config['downsample']:
@@ -394,6 +401,12 @@ def evaluate_calibration(_config, seed):
                                                    max_t=_config['max_t'], use_reflectance=_config['use_reflectance'],
                                                    normalize_images=_config['normalize_images'],
                                                    dataset=_config['dataset'], cam=_config['cam'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], data_type=_config['data_type'], fix_error=_config['fix_error'])
+        if _config['dataset'] == 'lg_innotek':
+            max_val_samples = min(2000, len(dataset_val))
+            dataset_val = torch.utils.data.Subset(
+                dataset_val,
+                list(range(max_val_samples)),
+            )
 
     def init_fn(x):
         return _init_fn(x, seed)
@@ -579,8 +592,13 @@ def evaluate_calibration(_config, seed):
             flow_mask[uv[:, 1], uv[:, 0]] = 1
 
             if _config['viz']:
-                viz_initial = overlay_imgs(rgb, depth_img_no_occlusion[-1].unsqueeze(0).unsqueeze(0), max_depth=0.5,
-                                           close_thr=1000)
+                viz_initial = overlay_imgs(
+                    rgb,
+                    depth_img_no_occlusion[-1].unsqueeze(0).unsqueeze(0),
+                    pooling=0,
+                    max_depth=0.5,
+                    close_thr=1000,
+                )
                 viz_initial_np = _to_numpy_image(viz_initial)
                 _save_viz_image(viz_initial_np,
                                 os.path.join(output_dir, 'init', f'init_{idex}_.png'),
@@ -599,6 +617,7 @@ def evaluate_calibration(_config, seed):
              uv, flow, points_3D, cam_params, real_shape, crop_offset) = apply_crop(
                 rgb, depth_img_no_occlusion, flow_img, flow_mask,
                 uv, flow, points_3D, real_shape, img_shape, cam_params, crop_mode)
+            sample['rgb'][idx] = rgb
 
             # Rebuild cam_model with cropped cam_params for PnP
             cam_model = CameraModel()
@@ -935,8 +954,13 @@ def evaluate_calibration(_config, seed):
                                                                     _config['occlusion_kernel'])
 
                 lidar_flow = new_depth_img_no_occlusion.unsqueeze(0).unsqueeze(0)
-                viz_final = overlay_imgs(sample['rgb'][idx].cuda(), lidar_flow, max_depth=_config['max_depth'] / 2,
-                                         close_thr=1000)
+                viz_final = overlay_imgs(
+                    sample['rgb'][idx].cuda(),
+                    lidar_flow,
+                    pooling=0,
+                    max_depth=_config['max_depth'] / 2,
+                    close_thr=1000,
+                )
                 viz_final_np = _to_numpy_image(viz_final)
                 comparison_fig, comparison_axes = plt.subplots(1, 2, figsize=(12, 8))
                 comparison_axes[0].imshow(viz_initial_np if viz_initial_np is not None else viz_final_np)

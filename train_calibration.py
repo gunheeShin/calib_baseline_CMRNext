@@ -25,7 +25,10 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.cuda import amp
 from matplotlib import cm
 
-from datasets.DatasetExtrinsicCalib import DatasetGeneralExtrinsicCalib, DatasetPandasetExtrinsicCalib
+from datasets.DatasetExtrinsicCalib import (
+    DatasetGeneralExtrinsicCalib,
+    DatasetPandasetExtrinsicCalib,
+)
 from camera_model import CameraModel
 from flow_losses import RAFT_loss2
 from utils import resize_dense_vector
@@ -90,7 +93,6 @@ def _generate_run_id(save_model_name: str) -> str:
     suffix = uuid.uuid4().hex[:8]
     base = _sanitize_run_id(save_model_name)
     return f"{base}_{ts}_{suffix}"
-
 
 def _all_reduce_sums(metric_sums: torch.Tensor) -> torch.Tensor:
     reduced = metric_sums.clone()
@@ -583,12 +585,7 @@ def _run_main(gpu, _config, common_seed, world_size):
             os.makedirs(debug_input_data_dir, exist_ok=True)
         dist.barrier()
 
-    # total_iter = starting_epoch * len(dataset)
-    total_iter = 0
-    dataset_custom = None
-    train_steps_per_epoch = None
-    for epoch in range(starting_epoch, _config['epochs']):
-
+    def _build_datasets():
         if _config['custom']:
             train_directories_custom = []
             for subdir in ['library_1', 'library_3', 'parking_lot_4', 'SC_1', 'SC_3', 'island_1', 'island_2', 'parking_lot_1']:
@@ -603,16 +600,17 @@ def _run_main(gpu, _config, common_seed, world_size):
             dataset_train = dataset_custom
 
         elif _config['data_type'] == 'lg_custom':
-
             if _config['dataset'] == 'hercules':
                 subdir_list = ['SC_1', 'SC_3', 'island_1']
             elif _config['dataset'] == 'lg_innotek':
-                subdir_list = ['001']
-
+                subdir_list = ['afternoon_parking_lot_1', 'afternoon_campus_1']
+            else:
+                raise RuntimeError(f"Unsupported lg_custom dataset: {_config['dataset']}")
             train_directories_lg_custom = []
             for subdir in subdir_list:
-                train_directories_lg_custom.append(os.path.join(_config['data_folder_custom'], _config['dataset'], subdir, 'offline'))
-
+                train_directories_lg_custom.append(
+                    os.path.join(_config['data_folder_custom'], _config['dataset'], subdir, 'offline')
+                )
 
             dataset_lg_custom = DatasetGeneralExtrinsicCalib(train_directories_lg_custom, train=True, max_r=_config['max_r'],
                                                          max_t=_config['max_t'],
@@ -705,21 +703,30 @@ def _run_main(gpu, _config, common_seed, world_size):
             if _config['dataset'] == 'hercules':
                 subdir_list = ['library_1']
             elif _config['dataset'] == 'lg_innotek':
-                subdir_list = ['002']
-
+                subdir_list = ['afternoon_campus_2']
+            else:
+                raise RuntimeError(f"Unsupported lg_custom dataset: {_config['dataset']}")
             test_directories_lg_custom = []
             for subdir in subdir_list:
-                test_directories_lg_custom.append(os.path.join(_config['data_folder_custom'], _config['dataset'], subdir, 'offline'))
+                test_directories_lg_custom.append(
+                    os.path.join(_config['data_folder_custom'], _config['dataset'], subdir, 'offline')
+                )
 
             dataset_val_lg_custom = DatasetGeneralExtrinsicCalib(test_directories_lg_custom, train=False, max_r=_config['max_r'],
                                                           max_t=_config['max_t'],
                                                           use_reflectance=_config['use_reflectance'],
                                                           normalize_images=_config['normalize_images'],
                                                           dataset=_config['dataset'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], data_type=_config['data_type'])
+            if _config['dataset'] == 'lg_innotek':
+                max_val_samples = min(3000, len(dataset_val_lg_custom))
+                dataset_val_lg_custom = torch.utils.data.Subset(
+                    dataset_val_lg_custom,
+                    list(range(max_val_samples)),
+                )
 
             dataset_val = dataset_val_lg_custom
 
-            print ("Len Hercules Val Dataset: ", len(dataset_val))
+            print(f"Len {_config['dataset']} Val Dataset: ", len(dataset_val))
 
         else:
             test_directories_kitti = []
@@ -741,6 +748,16 @@ def _run_main(gpu, _config, common_seed, world_size):
                                                              dataset='kitti')
 
             dataset_val = dataset_val_kitti
+
+        return dataset_train, dataset_val
+
+    dataset_train, dataset_val = _build_datasets()
+
+    # total_iter = starting_epoch * len(dataset)
+    total_iter = 0
+    dataset_custom = None
+    train_steps_per_epoch = None
+    for epoch in range(starting_epoch, _config['epochs']):
 
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             dataset_train,
@@ -912,7 +929,6 @@ def _run_main(gpu, _config, common_seed, world_size):
                     flow_arrows = _flow_arrows(flow_img, flow_mask, raw_rgb, step=step)
                     concat_img = np.concatenate([aligned_overlay, pc_overlay, flow_arrows], axis=1)
                     io.imsave(os.path.join(debug_input_data_dir, f"{base_name}_debug_concat.png"), concat_img)
-
 
             lidar_input = torch.stack(lidar_input)
             rgb_input = torch.stack(rgb_input)

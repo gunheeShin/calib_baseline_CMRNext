@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sys
 from math import radians
 
@@ -78,6 +79,25 @@ class ReadBinWithTime:
         return np.stack([data["x"], data["y"], data["z"], data["intensity"]], axis=1)
 
 
+class ReadBinKITTI:
+    def __call__(self, file):
+        data = np.fromfile(file, dtype=np.float32).reshape(-1, 4)
+        return data
+
+
+class ReadBinAutoDetect:
+    """Reads .bin point cloud files with auto-detection of 4-column (16 bytes/pt)
+    or 5-column (20 bytes/pt, all float32) formats."""
+    def __call__(self, file):
+        raw = np.fromfile(file, dtype=np.float32)
+        if raw.size % 4 == 0:
+            return raw.reshape(-1, 4)
+        elif raw.size % 5 == 0:
+            return raw.reshape(-1, 5)[:, :4]
+        else:
+            raise ValueError(f"Unsupported .bin point layout (size={raw.size}): {file}")
+
+
 def is_image(img):
     extensions = ['.jpg', '.png', '.tiff', '.jpeg', '.bmp']
     return os.path.splitext(img)[1] in extensions
@@ -98,6 +118,103 @@ def read_calib_file(filepath):
                 pass
 
     return data
+
+
+def _extract_floats(text):
+    return [float(x) for x in re.findall(r'[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?', text)]
+
+
+def _load_lg_intrinsic_file(intrinsic_path):
+    with open(intrinsic_path, 'r') as f:
+        content = f.read()
+
+    keyed_values = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or ('=' not in line and ':' not in line):
+            continue
+        key, value = re.split(r'[:=]', line, maxsplit=1)
+        key = key.strip().lower()
+        numbers = _extract_floats(value)
+        if numbers:
+            keyed_values[key] = numbers
+
+    if all(key in keyed_values for key in ['fx', 'fy', 'cx', 'cy']):
+        fx = keyed_values['fx'][0]
+        fy = keyed_values['fy'][0]
+        cx = keyed_values['cx'][0]
+        cy = keyed_values['cy'][0]
+        distortion = np.array(keyed_values.get('distcoeffs', []), dtype=np.float32)
+        intrinsic = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
+        return intrinsic, distortion
+
+    floats = _extract_floats(content)
+    if len(floats) >= 9:
+        intrinsic = np.array(floats[:9], dtype=np.float32).reshape(3, 3)
+        distortion = np.array(floats[9:17], dtype=np.float32)
+        return intrinsic, distortion
+
+    raise ValueError(f"Could not parse intrinsic file: {intrinsic_path}")
+
+
+def _scale_intrinsic_matrix(intrinsic, scale):
+    intrinsic = np.array(intrinsic, dtype=np.float32).copy()
+    intrinsic[0, 0] *= scale
+    intrinsic[1, 1] *= scale
+    intrinsic[0, 2] *= scale
+    intrinsic[1, 2] *= scale
+    return intrinsic
+
+
+def _load_lg_extrinsic_matrix(extrinsic_path, sensor_folder):
+    with open(extrinsic_path, 'r') as f:
+        file_data = yaml.safe_load(f)
+
+    true_extrinsic = file_data.get('true_extrinsic', {}) if file_data else {}
+    key = 'cam_to_radar' if 'radar' in sensor_folder.lower() else 'cam_to_lidar'
+    values = true_extrinsic.get(key)
+    if values is None:
+        raise KeyError(f"Missing true_extrinsic.{key} in {extrinsic_path}")
+
+    values = np.array(values, dtype=np.float32).reshape(-1)
+    if values.size == 16:
+        return values.reshape(4, 4)
+    if values.size != 7:
+        raise ValueError(f"Invalid extrinsic shape for {key}: {values.shape}")
+
+    tx, ty, tz, qx, qy, qz, qw = values.tolist()
+    q_norm = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if q_norm == 0:
+        raise ValueError(f"Invalid quaternion norm for {key}")
+    qx /= q_norm
+    qy /= q_norm
+    qz /= q_norm
+    qw /= q_norm
+
+    matrix = np.eye(4, dtype=np.float32)
+    matrix[:3, :3] = np.array([
+        [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw), 2.0 * (qx * qz + qy * qw)],
+        [2.0 * (qx * qy + qz * qw), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
+        [2.0 * (qx * qz - qy * qw), 2.0 * (qy * qz + qx * qw), 1.0 - 2.0 * (qx * qx + qy * qy)],
+    ], dtype=np.float32)
+    matrix[:3, 3] = np.array([tx, ty, tz], dtype=np.float32)
+    return matrix
+
+
+def _resolve_existing_name(base_dir, preferred_name, aliases):
+    candidates = [preferred_name] + list(aliases)
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isdir(os.path.join(base_dir, candidate)):
+            return candidate
+    return preferred_name
 
 
 # Generic point cloud reader from https://github.com/PRBonn/kiss-icp
@@ -262,6 +379,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
 
         self.distortion_coeffs = None
         self.undistort_map = None
+        self.rectified_intrinsics = None
+        self.undistort_size = None
         self.all_files = []
         self.synced_stamps = []
 
@@ -269,7 +388,6 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             dataset_dirs = [dataset_dirs]
 
         for directory in dataset_dirs:
-
             if dataset == 'argoverse':
                 for log_id in sorted(os.listdir(directory)):
                     self.sdbs[log_id] = SynchronizationDB(directory, collect_single_log_id=log_id)
@@ -309,21 +427,59 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                     self.all_files.append(os.path.join(img_folder, filename))
 
             if data_type == 'lg_custom':
-                with open(os.path.join(directory, '../..', 'calibration.yaml')) as f:
-                    file_data = yaml.safe_load(f)
+                sensor_root = os.path.join(directory, 'sensor_data')
+                dataset_root = os.path.abspath(os.path.join(directory, '..', '..'))
+                self.camera_folder = _resolve_existing_name(
+                    sensor_root, self.camera_folder, ['image_Cam0', 'image_left', 'camera']
+                )
+                self.maps_folder = _resolve_existing_name(
+                    sensor_root, self.maps_folder, [pcl_name, 'lidar_Hesai', 'radar_Continental', 'lidar', 'radar']
+                )
 
-                self.camera_intrinsics = torch.tensor(
-                    [file_data['fx'], file_data['fy'], file_data['cx'], file_data['cy']])
-                self.initial_extrinsic = torch.tensor(file_data['initial_extrinsic'], dtype=torch.float).reshape(4, 4)
-                self.distortion_coeffs = file_data.get('distortion_coeffs', None)
+                if self.dataset == 'lg_innotek':
+                    intrinsic_path = os.path.join(dataset_root, 'intrinsic.txt')
+                    extrinsic_path = os.path.join(dataset_root, 'lg_init_extrinsics.yaml')
+                    intrinsic_matrix, distortion_coeffs = _load_lg_intrinsic_file(intrinsic_path)
+                    # intrinsic.txt stores the native 8MP camera intrinsics, while the recorded
+                    # LG_Innotek images under offline/sensor_data are already downsampled by 2.
+                    intrinsic_matrix = _scale_intrinsic_matrix(intrinsic_matrix, 0.5)
+                    self.camera_intrinsics = torch.tensor(
+                        [
+                            intrinsic_matrix[0, 0],
+                            intrinsic_matrix[1, 1],
+                            intrinsic_matrix[0, 2],
+                            intrinsic_matrix[1, 2],
+                        ],
+                        dtype=torch.float32,
+                    )
+                    self.initial_extrinsic = torch.tensor(
+                        _load_lg_extrinsic_matrix(extrinsic_path, self.maps_folder), dtype=torch.float32
+                    )
+                    self.distortion_coeffs = distortion_coeffs if distortion_coeffs.size > 0 else None
+                else:
+                    with open(os.path.join(dataset_root, 'calibration.yaml')) as f:
+                        file_data = yaml.safe_load(f)
+
+                    self.camera_intrinsics = torch.tensor(
+                        [file_data['fx'], file_data['fy'], file_data['cx'], file_data['cy']],
+                        dtype=torch.float32,
+                    )
+                    self.initial_extrinsic = torch.tensor(
+                        file_data['initial_extrinsic'], dtype=torch.float32
+                    ).reshape(4, 4)
+                    distortion_coeffs = file_data.get('distortion_coeffs', None)
+                    self.distortion_coeffs = None if distortion_coeffs is None else np.array(
+                        distortion_coeffs, dtype=np.float32
+                    )
+
                 first_scan = os.listdir(os.path.join(directory,'sensor_data', self.maps_folder))
                 first_scan = sorted(first_scan)[0]
                 self.extension = os.path.splitext(first_scan)[1]
 
-                self.point_cloud_reader = ReadBinWithTime()
-                
-                img_folder = os.path.join(directory, self.camera_folder)
-                point_cloud_folder = os.path.join(directory, self.maps_folder)
+                if self.dataset == 'lg_innotek' and self.extension == '.bin':
+                    self.point_cloud_reader = ReadBinAutoDetect()
+                else:
+                    self.point_cloud_reader = ReadBinWithTime()
 
                 synced_stamp_path = os.path.join(directory, 'synced_stamps', self.camera_folder + '_' + self.maps_folder + '.txt')
                 synced_stamps_init_num = len(self.synced_stamps)
@@ -368,24 +524,33 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 self.fixed_errors = (rotx, roty, rotz, transl_x, transl_y, transl_z)
                 print(f"Using FIXED error for ALL frames : {self.fixed_errors} ...")
 
-    def _undistort_image(self, img_np):
+    def _undistort_image_and_calib(self, img_np, calib):
         if self.distortion_coeffs is None:
-            return img_np
-        fx, fy, cx, cy = self.camera_intrinsics.numpy()
+            return img_np, calib
+
+        fx, fy, cx, cy = calib.numpy()
         K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-        D = list(self.distortion_coeffs)
-        if len(D) == 0:
-            D = [0.0, 0.0, 0.0, 0.0, 0.0]
-        elif len(D) == 2:
-            D = D + [0.0, 0.0, 0.0]
-        elif len(D) == 4:
-            D = D + [0.0]
-        D = np.array(D, dtype=np.float64).reshape(1, -1)
+        D = np.asarray(self.distortion_coeffs, dtype=np.float64).reshape(-1)
+        if D.size == 0:
+            return img_np, calib
+        if D.size == 2:
+            D = np.concatenate([D, np.zeros(3, dtype=np.float64)])
+        elif D.size == 4:
+            D = np.concatenate([D, np.zeros(1, dtype=np.float64)])
+        D = D.reshape(1, -1)
         h, w = img_np.shape[:2]
-        if self.undistort_map is None:
+        if self.undistort_map is None or self.rectified_intrinsics is None or self.undistort_size != (w, h):
+            rectified_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), 0, (w, h))
             self.undistort_map, _ = cv2.initUndistortRectifyMap(
-                K, D, None, K, (w, h), cv2.CV_32FC2)
-        return cv2.remap(img_np, self.undistort_map, None, cv2.INTER_LINEAR, cv2.BORDER_CONSTANT)
+                K, D, None, rectified_K, (w, h), cv2.CV_32FC2)
+            self.rectified_intrinsics = torch.tensor(
+                [rectified_K[0, 0], rectified_K[1, 1], rectified_K[0, 2], rectified_K[1, 2]],
+                dtype=torch.float32,
+            )
+            self.undistort_size = (w, h)
+
+        image_undistorted = cv2.remap(img_np, self.undistort_map, None, cv2.INTER_LINEAR, cv2.BORDER_CONSTANT)
+        return image_undistorted, self.rectified_intrinsics.clone()
 
     def custom_transform(self, rgb, calib, img_rotation=0., flip=False):
         if self.train:
@@ -525,7 +690,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
 
         img = Image.open(img_path)
         if self.data_type == 'lg_custom':
-            img = Image.fromarray(self._undistort_image(np.array(img)))
+            img_np, calib = self._undistort_image_and_calib(np.array(img), calib)
+            img = Image.fromarray(img_np)
         h_mirror = False # 좌우 반전
         # if np.random.rand() > 0.5 and self.train:
         #     h_mirror = True
