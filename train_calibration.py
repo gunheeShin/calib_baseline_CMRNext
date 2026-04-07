@@ -101,6 +101,35 @@ def _all_reduce_sums(metric_sums: torch.Tensor) -> torch.Tensor:
     return reduced
 
 
+def _iter_base_datasets(dataset):
+    if isinstance(dataset, torch.utils.data.Subset):
+        yield from _iter_base_datasets(dataset.dataset)
+        return
+    if isinstance(dataset, torch.utils.data.ConcatDataset):
+        for sub_dataset in dataset.datasets:
+            yield from _iter_base_datasets(sub_dataset)
+        return
+    yield dataset
+
+
+def _collect_invalid_sample_stats(dataset):
+    total_known_invalid = 0
+    total_new_invalid = 0
+    total_resample_events = 0
+    for base_dataset in _iter_base_datasets(dataset):
+        if not hasattr(base_dataset, 'get_invalid_sample_stats'):
+            continue
+        stats = base_dataset.get_invalid_sample_stats()
+        total_known_invalid += stats.get('known_invalid_samples', 0)
+        total_new_invalid += stats.get('new_invalid_samples', 0)
+        total_resample_events += stats.get('resample_events', 0)
+    return {
+        'known_invalid_samples': total_known_invalid,
+        'new_invalid_samples': total_new_invalid,
+        'resample_events': total_resample_events,
+    }
+
+
 def _rasterize_sparse_flow(shape_hw, uv_flow, flow, device):
     flow_img = torch.zeros((shape_hw[0], shape_hw[1], 2), device=device, dtype=torch.float)
     flow_mask = torch.zeros((shape_hw[0], shape_hw[1]), device=device, dtype=torch.int)
@@ -996,6 +1025,21 @@ def _run_main(gpu, _config, common_seed, world_size):
                             'z_filter/filtered_points': z_stats['filtered_points'],
                         }, commit=False)
 
+            invalid_train_stats = _collect_invalid_sample_stats(dataset_train)
+            if invalid_train_stats['resample_events'] > 0:
+                logger.warning(
+                    "Invalid training samples: resampled %d times this epoch, %d new invalid samples discovered, %d known invalid samples cached.",
+                    invalid_train_stats['resample_events'],
+                    invalid_train_stats['new_invalid_samples'],
+                    invalid_train_stats['known_invalid_samples'],
+                )
+                if _config['wandb']:
+                    wandb.log({
+                        'invalid_train/resample_events': invalid_train_stats['resample_events'],
+                        'invalid_train/new_invalid_samples': invalid_train_stats['new_invalid_samples'],
+                        'invalid_train/known_invalid_samples': invalid_train_stats['known_invalid_samples'],
+                    }, commit=False)
+
         ## Test ##
         val_window_metrics = torch.zeros(2, device=device)
         val_epoch_metrics = torch.zeros(6, device=device)
@@ -1074,6 +1118,21 @@ def _run_main(gpu, _config, common_seed, world_size):
             logger.info('total test epe = %.3f' % total_test_epe)
             logger.info("------------------------------------")
 
+            invalid_val_stats = _collect_invalid_sample_stats(dataset_val)
+            if invalid_val_stats['resample_events'] > 0:
+                logger.warning(
+                    "Invalid validation samples: resampled %d times this epoch, %d new invalid samples discovered, %d known invalid samples cached.",
+                    invalid_val_stats['resample_events'],
+                    invalid_val_stats['new_invalid_samples'],
+                    invalid_val_stats['known_invalid_samples'],
+                )
+                if _config['wandb']:
+                    wandb.log({
+                        'invalid_val/resample_events': invalid_val_stats['resample_events'],
+                        'invalid_val/new_invalid_samples': invalid_val_stats['new_invalid_samples'],
+                        'invalid_val/known_invalid_samples': invalid_val_stats['known_invalid_samples'],
+                    }, commit=False)
+
             if _config['wandb']:
                 wandb.log({'Val Loss': total_test_loss,
                            'Val EPE': total_test_epe}, commit=False)
@@ -1130,8 +1189,8 @@ def _run_main(gpu, _config, common_seed, world_size):
                     os.remove(old_save_filename)
             old_save_filename = savefilename
 
-        # Cleanup
-        del sample, dataset_train, dataset_val, TrainImgLoader
+        # Cleanup per-epoch loader objects; datasets are reused across epochs.
+        del TrainImgLoader, TestImgLoader
 
     if rank == 0:
         logger.info('full training time = %.2f HR' % ((time.time() - start_full_time) / 3600))

@@ -1,9 +1,9 @@
 python3 evaluate_flow_calibration.py \
-	    --weights /ws/data/Checkpoint/cmrnext_full_radar_G3_LR1e-4_fourier6_zpwmyw0a/cmrnext_HerculesRadar_5_0.5_260326_LR1e-4_fourier6_102_9.403.tar \
+	    --weights /ws/data/Checkpoint/cmrnext_lg_full_lidar_G3_r5_t0.5_260405_a87vkeno/cmrnext_LgInnotek_5_0.5_260405_148_1.501.tar \
 	    --data_folder /ws/data/CustomDataset \
 	    --quantile 1.0 \
-	    --max_t 0 \
-	    --max_r 0 \
+	    --max_t 0.5 \
+	    --max_r 5 \
 		--dataset lg_innotek \
 	    --test_topic default \
 		--data_type lg_custom \
@@ -12,4 +12,4 @@ python3 evaluate_flow_calibration.py \
 		--fix_error False \
 		--resize_mode 2 \
 		--img_shape 536 960 \
-		--viz
+

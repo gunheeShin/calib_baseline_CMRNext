@@ -1,8 +1,10 @@
 import json
 import logging
+import multiprocessing as mp
 import os
 import re
 import sys
+import warnings
 from math import radians
 
 import cv2
@@ -352,6 +354,10 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         self.z_filter_max = z_filter_max
         self._z_filter_total = 0
         self._z_filter_removed = 0
+        self._invalid_sample_flags = None
+        self._invalid_sample_known_total = None
+        self._invalid_sample_new_since_last_report = None
+        self._invalid_sample_resamples_since_last_report = None
         self.normalize_images = normalize_images
         self.maps_folder = None
         self.extension = None
@@ -498,6 +504,11 @@ class DatasetGeneralExtrinsicCalib(Dataset):
 
                     print(f"Loaded {len(self.synced_stamps) - synced_stamps_init_num} new synced stamps from {synced_stamp_path}")
         print(f"Total {len(self.synced_stamps)} samples found")
+        dataset_len = len(self.synced_stamps) if self.data_type == 'lg_custom' else len(self.all_files)
+        self._invalid_sample_flags = mp.Array('b', dataset_len)
+        self._invalid_sample_known_total = mp.Value('i', 0)
+        self._invalid_sample_new_since_last_report = mp.Value('i', 0)
+        self._invalid_sample_resamples_since_last_report = mp.Value('i', 0)
         self.use_error_file = False
         if self.fix_error:
             if error_file is not None:
@@ -578,7 +589,59 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         self._z_filter_removed = 0
         return stats
 
+    def get_invalid_sample_stats(self):
+        """Return invalid-sample statistics while keeping the invalid index cache."""
+        with self._invalid_sample_new_since_last_report.get_lock():
+            new_invalid = self._invalid_sample_new_since_last_report.value
+            self._invalid_sample_new_since_last_report.value = 0
+        with self._invalid_sample_resamples_since_last_report.get_lock():
+            resample_events = self._invalid_sample_resamples_since_last_report.value
+            self._invalid_sample_resamples_since_last_report.value = 0
+        stats = {
+            'known_invalid_samples': self._invalid_sample_known_total.value,
+            'new_invalid_samples': new_invalid,
+            'resample_events': resample_events,
+        }
+        return stats
+
+    def _resample_index(self, idx, reason):
+        with self._invalid_sample_resamples_since_last_report.get_lock():
+            self._invalid_sample_resamples_since_last_report.value += 1
+
+        is_new_invalid = False
+        with self._invalid_sample_flags.get_lock():
+            if self._invalid_sample_flags[idx] == 0:
+                self._invalid_sample_flags[idx] = 1
+                is_new_invalid = True
+                with self._invalid_sample_known_total.get_lock():
+                    self._invalid_sample_known_total.value += 1
+                with self._invalid_sample_new_since_last_report.get_lock():
+                    self._invalid_sample_new_since_last_report.value += 1
+
+        dataset_len = self.__len__()
+        if self._invalid_sample_known_total.value >= dataset_len:
+            raise RuntimeError(f"All dataset samples became invalid. Last failure: {reason}")
+
+        for _ in range(min(dataset_len, 32)):
+            new_idx = np.random.randint(0, dataset_len)
+            if self._invalid_sample_flags[new_idx] == 0:
+                if reason is not None and is_new_invalid:
+                    print(f"[WARNING] Invalid sample idx={idx}. {reason}", file=sys.stderr, flush=True)
+                return new_idx
+
+        for offset in range(1, dataset_len + 1):
+            new_idx = (idx + offset) % dataset_len
+            if self._invalid_sample_flags[new_idx] == 0:
+                if reason is not None and is_new_invalid:
+                    print(f"[WARNING] Invalid sample idx={idx}. {reason}", file=sys.stderr, flush=True)
+                return new_idx
+
+        raise RuntimeError(f"Failed to find a valid replacement sample. Last failure: {reason}")
+
     def __getitem__(self, idx):
+        if self._invalid_sample_flags[idx] != 0:
+            return self.__getitem__(self._resample_index(idx, None))
+
         if self.dataset == 'kitti' or self.dataset == 'custom':
             img_path = self.all_files[idx]
             extension = os.path.basename(img_path)
@@ -615,14 +678,10 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             calib = self.camera_intrinsics.clone()
             if self.maps_folder == 'radar':
                 if pc.shape[0] == 0 or pc.shape[1] < 3:
-                    print(f"[WARNING] Empty or invalid point cloud at {pc_path}, resampling")
-                    new_idx = np.random.randint(0, self.__len__())
-                    return self.__getitem__(new_idx)
+                    return self.__getitem__(self._resample_index(idx, f"Empty or invalid point cloud at {pc_path}"))
                 valid_mask = pc[:, 2] >= -1.0
                 if not np.any(valid_mask):
-                    print(f"[WARNING] All points below z=-1.0 for {pc_path}, resampling")
-                    new_idx = np.random.randint(0, self.__len__())
-                    return self.__getitem__(new_idx)
+                    return self.__getitem__(self._resample_index(idx, f"All points below z=-1.0 for {pc_path}"))
                 pc = pc[valid_mask]
 
             if pc.shape[1] == 3:
@@ -639,9 +698,7 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             calib = self.camera_intrinsics.clone()
 
             if pc.shape[0] == 0 or pc.shape[1] < 3:
-                print(f"[WARNING] Empty or invalid point cloud at {pc_path}, resampling")
-                new_idx = np.random.randint(0, self.__len__())
-                return self.__getitem__(new_idx)
+                return self.__getitem__(self._resample_index(idx, f"Empty or invalid point cloud at {pc_path}"))
 
             # Z-axis ghost point filtering (training only)
             if self.train and (self.z_filter_min is not None or self.z_filter_max is not None):
@@ -657,9 +714,9 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 self._z_filter_removed += n_filtered
 
                 if not np.any(valid_mask):
-                    print(f"[WARNING] Z-filter removed ALL {n_before} points for {pc_path}, resampling")
-                    new_idx = np.random.randint(0, self.__len__())
-                    return self.__getitem__(new_idx)
+                    return self.__getitem__(self._resample_index(
+                        idx, f"Z-filter removed all {n_before} points for {pc_path}"
+                    ))
                 pc = pc[valid_mask]
 
             if pc.shape[1] == 3:
@@ -671,13 +728,9 @@ class DatasetGeneralExtrinsicCalib(Dataset):
                 sys.exit(1)
 
             if not os.path.exists(img_path):
-                print(f"[WARNING] Missing image for stamp {img_path}, resampling")
-                new_idx = np.random.randint(0, self.__len__())
-                return self.__getitem__(new_idx)
+                return self.__getitem__(self._resample_index(idx, f"Missing image for stamp {img_path}"))
             if not os.path.exists(pc_path):
-                print(f"[WARNING] Missing point cloud for stamp {pc_path}, resampling")
-                new_idx = np.random.randint(0, self.__len__())
-                return self.__getitem__(new_idx)
+                return self.__getitem__(self._resample_index(idx, f"Missing point cloud for stamp {pc_path}"))
 
         if self.use_reflectance:
             reflectance = torch.from_numpy(pc[:, -1]).float()
@@ -688,10 +741,31 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         if self.change_frame:
             pc_in = pc_in[[2, 0, 1, 3], :]
 
-        img = Image.open(img_path)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                img = Image.open(img_path)
+                img.load()
+        except Exception as exc:
+            return self.__getitem__(self._resample_index(
+                idx, f"Failed to open image path={img_path}: {exc}"
+            ))
+
         if self.data_type == 'lg_custom':
-            img_np, calib = self._undistort_image_and_calib(np.array(img), calib)
-            img = Image.fromarray(img_np)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    img_np = np.array(img)
+                if img_np.ndim < 2:
+                    raise ValueError(f"invalid image array shape {img_np.shape}")
+                img_np, calib = self._undistort_image_and_calib(img_np, calib)
+                img = Image.fromarray(img_np)
+            except Exception as exc:
+                image_stamp_str = locals().get('image_stamp', 'unknown')
+                return self.__getitem__(self._resample_index(
+                    idx,
+                    f"Failed to process image image_stamp={image_stamp_str} path={img_path}: {exc}",
+                ))
         h_mirror = False # 좌우 반전
         # if np.random.rand() > 0.5 and self.train:
         #     h_mirror = True
@@ -707,8 +781,9 @@ class DatasetGeneralExtrinsicCalib(Dataset):
         try:
             img = self.custom_transform(img, calib, img_rotation, h_mirror) # 이미지 flip 및 회전
         except OSError:
-            new_idx = np.random.randint(0, self.__len__())
-            return self.__getitem__(new_idx)
+            return self.__getitem__(self._resample_index(
+                idx, f"custom_transform failed for {img_path}"
+            ))
 
         # Rotate PointCloud for img_rotation
         if self.train:
