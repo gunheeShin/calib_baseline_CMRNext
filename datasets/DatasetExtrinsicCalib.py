@@ -700,8 +700,8 @@ class DatasetGeneralExtrinsicCalib(Dataset):
             if pc.shape[0] == 0 or pc.shape[1] < 3:
                 return self.__getitem__(self._resample_index(idx, f"Empty or invalid point cloud at {pc_path}"))
 
-            # Z-axis ghost point filtering (training only)
-            if self.train and (self.z_filter_min is not None or self.z_filter_max is not None):
+            # Z-axis ghost point filtering (applied in train and val for consistency)
+            if self.z_filter_min is not None or self.z_filter_max is not None:
                 n_before = pc.shape[0]
                 valid_mask = np.ones(n_before, dtype=bool)
                 if self.z_filter_min is not None:

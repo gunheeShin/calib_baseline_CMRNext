@@ -745,7 +745,8 @@ def _run_main(gpu, _config, common_seed, world_size):
                                                           max_t=_config['max_t'],
                                                           use_reflectance=_config['use_reflectance'],
                                                           normalize_images=_config['normalize_images'],
-                                                          dataset=_config['dataset'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], data_type=_config['data_type'])
+                                                          dataset=_config['dataset'], image_name=_config['image_name'], pcl_name=_config['pcl_name'], downsample=_config['downsize'], data_type=_config['data_type'],
+                                                          z_filter_min=_config.get('z_filter_min'), z_filter_max=_config.get('z_filter_max'))
             if _config['dataset'] == 'lg_innotek':
                 max_val_samples = min(3000, len(dataset_val_lg_custom))
                 dataset_val_lg_custom = torch.utils.data.Subset(
